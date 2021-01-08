@@ -1,0 +1,31 @@
+# Add '~/bin' to the '$PATH'
+export PATH="$HOME/bin:$PATH";
+
+# Add macports to the '$PATH'
+export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+
+# Add flutter to the '$PATH'
+export PATH="$HOME/Library/flutter/bin:$PATH"
+
+# Add conda to the '$PATH'
+__conda_setup="$(CONDA_REPORT_ERRORS=false '/opt/miniconda3/bin/conda' shell.bash hook 2> /dev/null)"
+if [ $? -eq 0 ]; then
+    \eval "$__conda_setup"
+else
+    if [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
+        . "/opt/miniconda3/etc/profile.d/conda.sh"
+        CONDA_CHANGEPS1=false conda activate base
+    else
+        \export PATH="$PATH:/opt/miniconda3/bin"
+    fi
+fi
+unset __conda_setup
+
+# Load the zsh dotfiles, and then some:
+for file in ~/.{zsh_aliases,zsh_functions,zsh_cluster,zsh_secrets}; do
+    source "$file";
+done;
+unset file;
+
+
+

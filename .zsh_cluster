@@ -1,0 +1,448 @@
+#!/bin/bash
+#================================================================
+#- IMPLEMENTATION
+#-    version         0.0.1
+#-    author          Maximilian Oppelt
+#-
+#================================================================
+#  HISTORY
+#     2021/01/01 : Maximilian Oppelt : File created.
+# 
+#================================================================
+
+function cluster_help()
+{
+    echo "# ================================================================"
+    echo "#  THE LAZY DEEP LEARNER CLUSTER SCRIPT"
+    echo "# ================================================================"
+    echo "# This function simplifies the managment (starting/stopping/observing)"
+    echo "# of deep learning jobs on the SSE deep learning cluster."
+    echo "#"
+    echo "#  USAGE"
+    echo "# ================================================================"
+    echo "#\tCreating a new job:       \tcluster run <JOBNAME>"
+    echo "#\tObserving current jobs:   \tcluster jobs"
+    echo "#\tPrinting log of job:      \tcluster <JOBNAME>"
+    echo "#\tCleaning (old) runs:      \tcluster clean"
+    echo "#\tDeleting (old) jobs:      \tcluster delete <JOBNAME>"
+    echo "#\tSynchronize outputs:      \tcluster sync"
+    echo "#\tMonitor cluster usage:    \tcluster monitor"
+    echo "#\tInit cluster environment: \tcluster init"
+    echo "#"
+    echo "# PARAMETERS"
+    echo "# ================================================================"
+    echo "# cluster --dl_user <USERSHORT>"
+    echo "#         --dl_host <SERVER>"
+    echo "#         --dl_gpus <#GPUS>"
+    echo "#         --dl_cpus <#CPUS>"
+    echo "#         --dl_memory <MEMSIZE>Mi"
+    echo "#         --dl_image <DOCKERHUB>"
+    echo "#         -w"
+    echo "#         jobs"
+    echo "# --dl_user   \t-u <USERSHORT> is the username on the cluster. If not set the local user name is used."
+    echo "# --dl_host   \t-s The name of the remote cluster. [Default: dlcluster1head]"
+    echo "# --dl_gpus   \t-g Number of GPUs. [Default: 1]"
+    echo "# --dl_cpus   \t-c Number of CPUs. [Default: 4]"
+    echo "# --dl_memory \t-i Docker image used for container creation. [Default: pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel]"
+    echo "#             \t-w Enables live view."
+    echo "#             \t-h Prints this help."
+    echo "# ================================================================"
+}
+
+function cluster()
+{
+    # Login information for the cluster
+    local dl_user=$USER
+    local dl_host=dlcluster1head
+
+    # The kubernetes manifest defaults
+    local dl_ngpus=1
+    local dl_ncpus=4
+    local dl_memory=16284Mi
+
+    local dl_image=pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel
+
+    local dl_watch=0
+
+    local do_init=0
+    local do_run=0
+    local do_log=0
+    local do_jobs=0
+    local do_clear=0
+    local do_delete=0
+    local do_sync=0
+    local do_monitor=0
+
+    local ssh_connection=0
+
+    while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dl_user*|-u*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_user="${1#*=}"
+            ;;
+
+        --dl_host*|-s*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_host="${1#*=}"
+            ;;
+
+        --dl_gpus*|-g*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_ngpus="${1#*=}"
+            ;;
+
+        --dl_cpus*|-c*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_ncpus="${1#*=}"
+            ;;
+
+        --dl_memory*|-m*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_memory="${1#*=}"
+            ;;
+
+        --dl_image*|-i*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_image="${1#*=}"
+            ;;
+
+        -w)
+            dl_watch=1
+            ;;
+
+        init)
+            do_init=1
+            ;;
+
+        jobs)
+            do_jobs=1
+            ;;
+
+        clean)
+            do_clear=1
+            ;;
+
+        sync)
+            do_sync=1
+            ;;
+ 
+        log*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                if [[ "${1#*=}" ]]; then
+                    job_name="${1#*=}"
+                else
+                    echo "ERROR: No job name provided."
+                    return 1
+                fi
+                do_log=1
+            ;;
+
+        delete)
+            if [[ "$1" != *=* ]]; then shift; fi
+                if [[ "${1#*=}" ]]; then
+                    job_name="${1#*=}"
+                    # Remove suffix automatically
+                    job_name="${job_name//-master-0/}"
+                else
+                    echo "ERROR: No job name provided."
+                    return 1
+                fi
+                do_delete=1
+            ;;
+ 
+        run)
+            if [[ "$1" != *=* ]]; then shift; fi
+                if [[ "${1#*=}" ]]; then
+                    job_name="${1#*=}"
+                    echo "INFO: Running $job_name"
+                else
+                    echo "ERROR: No job name provided."
+                    return 1
+                fi
+                do_run=1
+            ;;
+
+        monitor)
+            do_monitor=1
+            ;;
+
+
+        -h)
+            cluster_help
+            return 1
+            ;;
+        *)
+            >&2 printf "ERROR: Invalid argument\n"
+            cluster_help
+            return 1
+        ;;
+    esac
+    shift
+    done
+
+    # Current folder name
+    local project_name=${PWD##*/}
+    local project_name="${project_name//_/-}"
+
+    # General Information Cluster container scope
+    # NAME:     CLUSTER SCOPE                 CONTAINER SCOPE
+    # data:     /scratch/data/<USERSHORT>     /data/<USERSHORT>
+    # output:   /scratch/output/<USERSHORT>   /output/
+    # home:     /home/<USERSHORT>             /home/<USERSHORT>
+
+    local dl_home_directory="/home/$dl_user"
+    local dl_project_directory="$dl_home_directory/projects"
+
+    local dl_date="$(date -u +"%Y-%m-%d-%H-%M-%S")"
+    local dl_job_name="$project_name"-"$dl_date"-"$job_name"
+    local dl_project_name=$dl_project_directory/$dl_job_name
+    local dl_manifest_script="$dl_project_directory/$dl_job_name/run.yml"
+    local dl_runner_script="$dl_project_directory/$dl_job_name/$project_name/run.sh"
+
+    # Define variables in container scope
+    local container_project_dir="/home/$dl_user/projects/$dl_job_name/$project_name"
+    local container_output_dir="/output"
+    local container_input_dir="/data/"$dl_user
+
+    # The local project defaults
+    local local_project=${PWD}
+
+    # Initilize the cluster environment
+    if [[ "$do_init" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]] 
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+        local local_ssh_directory="$HOME/.ssh"
+
+        # Generate rsa files if it does not exist
+        if [[ -f $local_ssh_file/id_rsa ]]
+        then
+            echo "INFO: RSA key exists on $local_ssh_directory/id_rsa, using existing file"
+        else
+            ssh-keygen -t rsa -f "$local_ssh_directory/id_rsa"
+            echo INFO: RSA key pair generated
+        fi
+
+        echo "We need to log into $dl_host as $dl_user to set up your public key."
+        cat "$local_ssh_directory/id_rsa.pub" | ssh "$dl_host" -l "$dl_user" ' [ -d ~/.ssh ] || \
+                                                                    mkdir -p ~/.ssh ; \
+                                                                    cat > ~/.ssh/KEY ; \
+                                                                    KEY=$(cat ~/.ssh/KEY) ; \
+                                                                    export KEY ; \
+                                                                    grep -q "$KEY" ~/.ssh/authorized_keys || \
+                                                                    cat ~/.ssh/KEY >> .ssh/authorized_keys ; \
+                                                                    chmod 700 ~/.ssh ; \
+                                                                    chmod 600 ~/.ssh/authorized_keys ;
+                                                                    rm ~/.ssh/KEY'
+        id_rsa_transfer_status=$?
+
+        if [[ $id_rsa_transfer_status -eq 0 ]] then;
+            echo "INFO: SSH set up complete: [HOST: $dl_host]"
+        else
+            echo "ERROR: SSH setup failed."
+            return 1
+        fi
+
+        # Create project directory
+        ssh $dl_user@$dl_host 'mkdir projects'
+        ssh $dl_user@$dl_host 'touch .hushlogin'
+        ssh $dl_user@$dl_host "ln -s /scratch/data/$dl_user/ data"
+        ssh $dl_user@$dl_host "ln -s /scratch/output/$dl_user/ output"
+        return 0
+    fi
+
+    # Check if ssh status can be established
+    local dlssh_status=$(ssh -o BatchMode=yes -o ConnectTimeout=5 $dl_user@$dl_host echo ok 2>&1)
+    if [[ $dlssh_status == ok ]] ; then
+        echo "INFO: Authentification using ssh valid."
+    elif [[ $dlssh_status == "Permission denied"* ]] ; then
+        echo "ERROR: Authentification using ssh invalid: Permission denied."
+        return 1
+    else
+        echo "ERROR: Unknown Error during ssh login."
+        return 1
+    fi
+
+    # Get uid and group id
+    dl_uid=$(ssh $dl_user@$dl_host 'id -u $dl_user')
+    dl_gid=$(ssh $dl_user@$dl_host 'id -g $dl_user')
+
+    # Show current jobs
+    if [[ "$do_jobs" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]] 
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+
+        # Show all running kubectl jobs (either once or live)
+        if [[ "$dl_watch" = 1 ]]; then
+            echo "INFO: Interrupt with Ctrl+C."
+            ssh $dl_user@$dl_host 'kubectl get pods -w'
+        else
+            ssh $dl_user@$dl_host 'kubectl get pods'
+        fi
+        return 0
+    fi
+
+    # Show log of worker
+    if [[ "$do_log" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]] || [[ -z "$job_name" ]]
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+
+        # Show log files (either once or live)
+        if [[ "$dl_watch" = 1 ]]; then
+            echo "INFO: Interrupt with Ctrl+C."
+            local kubectl_logs="kubectl logs $job_name --follow"
+            echo "$kubectl_logs" | ssh $dl_user@$dl_host -T
+        else
+            local kubectl_logs="kubectl logs $job_name"
+            echo "$kubectl_logs" | ssh $dl_user@$dl_host -T
+        fi
+        return 0
+    fi
+
+    # Delete worker
+    if [[ "$do_delete" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_ngpus" ]] || [[ -z "$job_name" ]]
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+
+        echo "INFO: Deleting $job_name"
+        local kubectl_logs="kubectl delete PyTorchJob $job_name"
+        echo "$kubectl_logs" | ssh $dl_user@$dl_host -T
+        return 0
+    fi
+
+    # Clear old manifest files
+    if [[ "$do_clear" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_ngpus" ]] || [[ -z "$dl_ncpus" ]]
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+        ssh $dl_user@$dl_host "rm -R $dl_project_directory/*"
+        echo "INFO: Cleaned up projects."
+        return 0
+    fi
+    local kubectl_manifest="apiVersion: kubeflow.org/v1beta2
+kind: PyTorchJob
+metadata:
+  name: $dl_job_name
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 60
+      template:
+        metadata:
+          creationTimestamp: null
+        spec:
+          containers:
+            - name: pytorch
+              image: $dl_image
+              command: [\"/bin/sh\",\"-c\"]
+              args:
+              - export uid=$dl_uid ; export gid=$dl_gid ; export project_dir=$container_project_dir ; export output_dir=$container_output_dir ; export input_dir=$container_input_dir ; /bin/sh $dl_runner_script ;
+              resources:
+                limits:
+                  nvidia.com/gpu: $dl_ngpus
+                  cpu: $dl_ncpus
+                  memory: $dl_memory
+              volumeMounts:
+              - mountPath: /data/$dl_user
+                name: nfs-data
+              - mountPath: /output
+                name: nfs-output
+              - mountPath: /home/$dl_user
+                name: nfs-home
+          nodeSelector:
+            accelerator: nvidia-tesla-p100
+          volumes:
+          - name: nfs-data
+            persistentVolumeClaim:
+              claimName: kflow-$dl_user-data-pvc
+          - name: nfs-output
+            persistentVolumeClaim:
+              claimName: kflow-$dl_user-output-pvc
+          - name: nfs-home
+            persistentVolumeClaim:
+              claimName: kflow-$dl_user-home-pvc
+";
+    # Copy project files, write a manifest, create a kubectl job
+    if [[ "$do_run" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_ngpus" ]] || [[ -z "$dl_ncpus" ]] || [[ -z "$dl_project_name" ]]
+        then
+            echo "ERROR: Some or all of the parameters are empty"
+            cluster_help
+            return 1
+        fi
+        # Check for git repositories
+        local git_repo="$(git rev-parse --is-inside-work-tree 2>/dev/null)"
+        if [[ "$git_repo" ]]; then
+            if [[ $(git rev-parse --show-toplevel) != $(pwd) ]] ; then
+                echo "ERROR: Not in git root directory"
+                return 1
+            fi
+        else
+            echo "WARNING: Folder is no git repository"
+        fi
+        # Syncing local project to deep learning cluster
+        echo "INFO: Synced $local_project to $dl_user"@"$dl_host:$dl_project_name"
+        rsync --exclude '.git' -av --delete -e ssh $local_project $dl_user@$dl_host:$dl_project_name/
+
+        echo "INFO: Cluster user has [UID:GID]: $dl_uid:$dl_gid"
+
+        # Write manifest to remote location
+        echo "$kubectl_manifest" | ssh $dl_user@$dl_host -T "cat > $dl_manifest_script"
+        echo "INFO: Created manifest $manifest_name"
+
+        # Create kubectl job
+        ssh $dl_user@$dl_host "kubectl create -f $dl_manifest_script"
+        return 0
+    fi
+
+    # Synchronize the output directory
+    if [[ "$do_sync" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]]
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+
+        echo "INFO: Syncronize output directory to local output directory"
+        rsync -av --delete -e ssh $dl_user@$dl_host:~/output/ ~/output/
+        return 0
+    fi
+
+    # Monitor cluster usage
+    if [[ "$do_monitor" = 1 ]] then;
+        if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]]
+        then
+            echo "ERROR: Some or all of the required parameters are empty"
+            cluster_help
+            return 1
+        fi
+
+        ssh $dl_user@$dl_host "sh /usr/local/bin/monitor-gpu"
+        echo ""
+        ssh $dl_user@$dl_host "sh /usr/local/bin/monitor-nodes"
+        return 0
+    fi
+}
+
