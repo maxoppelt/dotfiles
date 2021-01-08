@@ -22,7 +22,7 @@ function cluster_help()
     echo "# ================================================================"
     echo "#\tCreating a new job:       \tcluster run <JOBNAME>"
     echo "#\tObserving current jobs:   \tcluster jobs"
-    echo "#\tPrinting log of job:      \tcluster <JOBNAME>"
+    echo "#\tPrinting log of job:      \tcluster log <JOBNAME>"
     echo "#\tCleaning (old) runs:      \tcluster clean"
     echo "#\tDeleting (old) jobs:      \tcluster delete <JOBNAME>"
     echo "#\tSynchronize outputs:      \tcluster sync"
