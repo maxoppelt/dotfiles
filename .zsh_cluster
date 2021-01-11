@@ -371,6 +371,8 @@ spec:
                 name: nfs-output
               - mountPath: /home/$dl_user
                 name: nfs-home
+              - mountPath: /dev/shm
+                name: dshm
           nodeSelector:
             accelerator: nvidia-tesla-p100
           volumes:
@@ -383,6 +385,9 @@ spec:
           - name: nfs-home
             persistentVolumeClaim:
               claimName: kflow-$dl_user-home-pvc
+          - name: dshm
+            emptyDir:
+              medium: Memory
 ";
     # Copy project files, write a manifest, create a kubectl job
     if [[ "$do_run" = 1 ]] then;
