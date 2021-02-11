@@ -47,7 +47,7 @@ set secure
 set number
 " Enable syntax highlighting
 syntax on
-color darcula
+" color darcula
 " Highlight current line
 set cursorline
 " Make tabs as wide as two spaces

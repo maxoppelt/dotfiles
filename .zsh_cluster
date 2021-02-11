@@ -1,12 +1,13 @@
 #!/bin/bash
 #================================================================
 #- IMPLEMENTATION
-#-    version         0.0.1
+#-    version         0.0.2
 #-    author          Maximilian Oppelt
 #-
 #================================================================
 #  HISTORY
 #     2021/01/01 : Maximilian Oppelt : File created.
+#     2021/02/11 : Maximilian Oppelt : Add script name as option
 # 
 #================================================================
 
@@ -44,6 +45,7 @@ function cluster_help()
     echo "# --dl_gpus        \t-g Number of GPUs. [Default: 1]"
     echo "# --dl_cpus        \t-c Number of CPUs. [Default: 4]"
     echo "# --dl_memory      \t-c Memory size. [Default: 16284Mi]"
+    echo "# --dl_script      \t-c Deep Learning Script. [Default: run.sh]"
     echo "# --dl_accelerator \t-a GPU accelerator type. [Default: nvidia-tesla-p100] (Available: nvidia-tesla-p40)"
     echo "# --dl_image       \t-i Docker image used for container creation. [Default: pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel]"
     echo "#                  \t-w Enables live view."
@@ -59,11 +61,12 @@ function cluster()
 
     # The kubernetes manifest defaults
     local dl_ngpus=1
-    local dl_ncpus=4
+    local dl_ncpus=8
     local dl_memory=16284Mi
 
-    local dl_image=pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel
+    local dl_image=pytorch/pytorch:1.7.1-cuda11.0-cudnn8-devel
     local dl_accelerator=nvidia-tesla-p100
+    local dl_script=run.sh
 
     local dl_watch=0
 
@@ -113,6 +116,11 @@ function cluster()
         --dl_accelerator*|-i*)
             if [[ "$1" != *=* ]]; then shift; fi
                 local dl_accelerator="${1#*=}"
+            ;;
+
+        --dl_script*|-i*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_script="${1#*=}"
             ;;
 
         -w)
@@ -206,7 +214,7 @@ function cluster()
     local dl_job_name="$project_name"-"$dl_date"-"$job_name"
     local dl_project_name=$dl_project_directory/$dl_job_name
     local dl_manifest_script="$dl_project_directory/$dl_job_name/run.yml"
-    local dl_runner_script="$dl_project_directory/$dl_job_name/$project_name/run.sh"
+    local dl_runner_script="$dl_project_directory/$dl_job_name/$project_name/$dl_script"
 
     # Define variables in container scope
     local container_project_dir="/home/$dl_user/projects/$dl_job_name/$project_name"
