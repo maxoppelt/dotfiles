@@ -34,6 +34,7 @@ function cluster_help()
     echo "# ================================================================"
     echo "# cluster --dl_user <USERSHORT>"
     echo "#         --dl_host <SERVER>"
+    echo "#         --dl_nodes <#NODES>"
     echo "#         --dl_gpus <#GPUS>"
     echo "#         --dl_cpus <#CPUS>"
     echo "#         --dl_memory <MEMSIZE>Mi"
@@ -42,12 +43,13 @@ function cluster_help()
     echo "#         jobs"
     echo "# --dl_user       \t-u <USERSHORT> is the username on the cluster. If not set the local user name is used."
     echo "# --dl_host        \t-s The name of the remote cluster. [Default: dlcluster1head]"
+    echo "# --dl_nodes       \t-s Number of Nodes. [Default: 1]"
     echo "# --dl_gpus        \t-g Number of GPUs. [Default: 1]"
-    echo "# --dl_cpus        \t-c Number of CPUs. [Default: 4]"
+    echo "# --dl_cpus        \t-c Number of CPUs. [Default: 8]"
     echo "# --dl_memory      \t-c Memory size. [Default: 16284Mi]"
     echo "# --dl_script      \t-c Deep Learning Script. [Default: run.sh]"
     echo "# --dl_accelerator \t-a GPU accelerator type. [Default: nvidia-tesla-p100] (Available: nvidia-tesla-p40)"
-    echo "# --dl_image       \t-i Docker image used for container creation. [Default: pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel]"
+    echo "# --dl_image       \t-i Docker image used for container creation. [Default: pytorch/pytorch:1.8.1-cuda11.1-cudnn8-devel]"
     echo "#                  \t-w Enables live view."
     echo "#                  \t-h Prints this help."
     echo "# ================================================================"
@@ -60,11 +62,12 @@ function cluster()
     local dl_host=dlcluster1head
 
     # The kubernetes manifest defaults
+    local dl_nodes=1
     local dl_ngpus=1
     local dl_ncpus=8
     local dl_memory=16284Mi
 
-    local dl_image=pytorch/pytorch:1.7.1-cuda11.0-cudnn8-devel
+    local dl_image=pytorch/pytorch:1.8.1-cuda11.1-cudnn8-devel
     local dl_accelerator=nvidia-tesla-p100
     local dl_script=run.sh
 
@@ -91,6 +94,11 @@ function cluster()
         --dl_host*|-s*)
             if [[ "$1" != *=* ]]; then shift; fi
                 local dl_host="${1#*=}"
+            ;;
+
+        --dl_nodes*|-n*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_nodes="${1#*=}"
             ;;
 
         --dl_gpus*|-g*)
@@ -362,7 +370,7 @@ spec:
   pytorchReplicaSpecs:
     Master:
       replicas: 1
-      restartPolicy: OnFailure
+      restartPolicy: Never
       ttlSecondsAfterFinished: 60
       template:
         metadata:
@@ -373,7 +381,7 @@ spec:
               image: $dl_image
               command: [\"/bin/sh\",\"-c\"]
               args:
-              - export uid=$dl_uid ; export gid=$dl_gid ; export project_dir=$container_project_dir ; export output_dir=$container_output_dir ; export input_dir=$container_input_dir ; /bin/sh $dl_runner_script ;
+              - export nodes=$dl_nodes ; export ngpus=$dl_ngpus ; export uid=$dl_uid ; export gid=$dl_gid ; export project_dir=$container_project_dir ; export output_dir=$container_output_dir ; export input_dir=$container_input_dir ; /bin/sh $dl_runner_script ;
               resources:
                 limits:
                   nvidia.com/gpu: $dl_ngpus
@@ -404,6 +412,60 @@ spec:
             emptyDir:
               medium: Memory
 ";
+
+    # Taining on multiple workers (e.g. using pytorch distributed data parallel)
+    if [[ "$dl_nodes" -gt 1 ]] then;
+        echo "Training on $dl_nodes nodes using each $dl_ngpus gpus"
+local kubectl_manifest=$kubectl_manifest"    Worker:
+      replicas: "$((dl_nodes-1))"
+      restartPolicy: Never
+      template:
+        metadata:
+          creationTimestamp: null
+        spec:
+          TTLAfterFinished: 60
+          containers:
+          - args:
+             - export nodes=$dl_nodes ; export ngpus=$dl_ngpus ; export uid=$dl_uid ; export gid=$dl_gid ; export project_dir=$container_project_dir ; export output_dir=$container_output_dir ; export input_dir=$container_input_dir ; /bin/sh $dl_runner_script ;
+            command: [\"/bin/sh\",\"-c\"]
+            image: $dl_image
+            name: pytorch
+            resources:
+              limits:
+                nvidia.com/gpu: $dl_ngpus
+                cpu: $dl_ncpus
+                memory: $dl_memory
+            volumeMounts:
+            - mountPath: /data/$dl_user
+              name: nfs-data
+            - mountPath: /output
+              name: nfs-output
+            - mountPath: /home/$dl_user
+              name: nfs-home
+            - mountPath: /dev/shm
+              name: dshm
+          nodeSelector:
+            accelerator: $dl_accelerator
+          restartPolicy: OnFailure
+          ttlSecondsAfterFinishing: 1
+          volumes:
+          - name: nfs-data
+            persistentVolumeClaim:
+              claimName: kflow-$dl_user-data-pvc
+          - name: nfs-output
+            persistentVolumeClaim:
+              claimName: kflow-$dl_user-output-pvc
+          - name: nfs-home
+            persistentVolumeClaim:
+              claimName: kflow-$dl_user-home-pvc
+          - name: dshm
+            emptyDir:
+              medium: Memory
+";
+    else
+        echo "Training on single node uinsg $dl_ngpus"
+    fi
+
     # Copy project files, write a manifest, create a kubectl job
     if [[ "$do_run" = 1 ]] then;
         if [[ -z "$dl_user" ]] || [[ -z "$dl_ngpus" ]] || [[ -z "$dl_ncpus" ]] || [[ -z "$dl_project_name" ]]
