@@ -109,7 +109,8 @@ set rtp+=~/.vim/bundle/Vundle.vim
 call vundle#begin()
 
 Plugin 'gmarik/Vundle.vim'
-Plugin 'powerline/powerline', {'rtp': 'powerline/bindings/vim/'}
+" Plugin 'powerline/powerline', {'rtp': 'powerline/bindings/vim/'}
+Plugin 'powerline/powerline'
 Plugin 'ervandew/supertab'
 Plugin 'davidhalter/jedi-vim'
 Plugin 'terryma/vim-multiple-cursors'

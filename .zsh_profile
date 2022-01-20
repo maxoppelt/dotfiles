@@ -2,7 +2,7 @@
 export PATH="$HOME/bin:$PATH";
 
 # Add macports to the '$PATH'
-export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+export PATH="/opt/local/bin:/opt/local/sbin:$PATH";
 
 # >>> conda initialize >>>
 # !! Contents within this block are managed by 'conda init' !!
@@ -18,9 +18,10 @@ else
 fi
 unset __conda_setup
 # <<< conda initialize <<<
+export PATH="/Users/opt/miniconda3/bin:$PATH"
 
 # Load the zsh dotfiles, and then some:
-for file in ~/.{zsh_aliases,zsh_functions,zsh_cluster}; do
+for file in ~/.{zsh_aliases,zsh_functions,zsh_cluster,zsh_secrets}; do
     source "$file";
 done;
 unset file;

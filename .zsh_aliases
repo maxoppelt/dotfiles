@@ -1,7 +1,30 @@
 # Set ssh aliases for faster login
-alias sshdlc="ssh opt@dlcluster1head.iis.fhg.de"
+alias sshmed="ssh medisec@r10726.iis.fhg.de"
+
+# Student device in 0R2.04 - Linux GTX 1660 Ti
+alias sshlin="ssh opt@r10393.iis.fhg.de"
+
+# Windows workstation in 0R2.05 - Windows
 alias sshiis="ssh opt@ip3346.iis.fhg.de"
+
+# Cluster environment
+alias sshdlc="ssh opt@dlcluster1scratch.iis.fhg.de"
+
+# Deprecated Deep Learning Cluster
+# alias sshdlc="ssh opt@dlcluster1head.iis.fhg.de"
+
+# Home PC
 alias sshpc="ssh max@DESKTOP-SOEQRA2"
+
+# Deep Learning workstations - Linux RTX 3090 24 GB
+alias sshdl1="ssh opt@r10973.iis.fhg.de"
+alias sshdl2="ssh opt@r10974.iis.fhg.de"
+alias sshdl3="ssh opt@r10975.iis.fhg.de"
+alias sshdl4="ssh opt@r10976.iis.fhg.de"
+alias sshdl5="ssh opt@r10977.iis.fhg.de"
+
+# Docker is not free anymore
+alias docker='podman'
 
 # Enable aliases to be sudo’ed
 alias sudo='sudo '
