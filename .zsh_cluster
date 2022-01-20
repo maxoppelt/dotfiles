@@ -1,7 +1,7 @@
 #!/bin/zsh
 #================================================================
 #- IMPLEMENTATION
-#-    version         0.0.4
+#-    version         0.0.5
 #-    author          Maximilian Oppelt
 #-
 #================================================================
@@ -12,6 +12,7 @@
 #     2021/12/23 : Maximilian Oppelt : New custom image for faster startup
 #     2021/12/24 : Maximilian Oppelt : The cluster script will be deprecated 01/2022
 #                                      Added initial version for new interface.
+#     2022/01/20 : Maximilian Oppelt : Increased shared memory for pytorch dataloader.
 #
 #================================================================
 
@@ -238,15 +239,16 @@ function dlr() {
           -e ssh ${PWD}/ $dl_user@$dl_host:$dl_scope_home/projects/$dl_name
 
     # Create/Build kubectl manifest file
+    if [[ $dl_nodes == 1 ]]; then
     local manifest="---
 apiVersion: v1
 kind: Pod
 metadata:
   name: $dl_name
 spec:
-  restartPolicy: OnFailure
+  restartPolicy: Never
   containers:
-  - name: dl-gpu-job # Can be changed
+  - name: dl-gpu-job
     image: $dl_image
     command:
     - sh
@@ -280,6 +282,8 @@ spec:
       mountPath: $container_scope_data
     - name: nfs-home
       mountPath: $container_scope_home
+    - mountPath: /dev/shm
+      name: dshm
   volumes:
   - name: nfs-output
     nfs:
@@ -296,7 +300,13 @@ spec:
       server: 10.54.182.12
       path: $dl_scope_home
       readOnly: true
+  - name: dshm
+    emptyDir:
+      medium: Memory
     "
+    else
+
+    fi
     
     echo $manifest | kubectl create -f -
 }
