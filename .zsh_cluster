@@ -1,7 +1,7 @@
 #!/bin/zsh
 #================================================================
 #- IMPLEMENTATION
-#-    version         0.0.5
+#-    version         0.0.6
 #-    author          Maximilian Oppelt
 #-
 #================================================================
@@ -13,20 +13,9 @@
 #     2021/12/24 : Maximilian Oppelt : The cluster script will be deprecated 01/2022
 #                                      Added initial version for new interface.
 #     2022/01/20 : Maximilian Oppelt : Increased shared memory for pytorch dataloader.
+#     2022/01/21 : Maximilian Oppelt : Multi node gpu training for pytorch.
 #
 #================================================================
-
-function dli() {
-    local name=""
-    if [[ "${1}" ]]; then
-        name="${1}"
-        # name="${job_name//-master-0/}"
-    else
-        echo "ERROR: No job name provided."
-        return 1
-    fi
-    kubectl describe pod $name
-}
 
 function dlh()
 {
@@ -42,7 +31,7 @@ function dlh()
     echo "#\tPrinting log of job:      \tdll <JOBNAME>"
     echo "#\tDeleting (old) jobs:      \tdld <JOBNAME>"
     echo "#\tObserving current jobs:   \tdls"
-    echo "#\tRemove all jobs:          \tdla"
+    echo "#\tRemove all jobs:          \tdlda"
     echo "# ===================================================================="
 } 
 
@@ -78,7 +67,7 @@ function dlda() {
     kubectl get pods -o wide
     select yn in "Yes" "No"; do
     case $yn in
-        Yes ) kubectl delete --all pods ; return ;;
+        Yes ) kubectl delete --all PyTorchJob ; return ;;
         No ) return ;;
     esac
     done
@@ -93,8 +82,21 @@ function dld() {
         echo "ERROR: No job name provided."
         return 1
     fi
-    kubectl delete Pod $name
+    kubectl delete PyTorchJob $name
 }
+
+function dli() {
+    local name=""
+    if [[ "${1}" ]]; then
+        name="${1}"
+        # name="${job_name//-master-0/}"
+    else
+        echo "ERROR: No job name provided."
+        return 1
+    fi
+    kubectl describe PyTorchJob $name
+}
+
 
 function dls() {
     watch=0 
@@ -110,9 +112,9 @@ function dls() {
     # Show all running kubectl jobs (either once or live)
     if [[ "$watch" = 1 ]]; then
         echo "INFO: Interrupt with Ctrl+C."
-        kubectl get pods -w -o wide
+        kubectl get PyTorchJobs -w -o wide
     else
-        kubectl get pods -o wide
+        kubectl get PyTorchJobs -o wide
     fi
 }
 
@@ -239,75 +241,144 @@ function dlr() {
           -e ssh ${PWD}/ $dl_user@$dl_host:$dl_scope_home/projects/$dl_name
 
     # Create/Build kubectl manifest file
-    if [[ $dl_nodes == 1 ]]; then
     local manifest="---
-apiVersion: v1
-kind: Pod
+apiVersion: \"kubeflow.org/v1\"
+kind: PyTorchJob
 metadata:
   name: $dl_name
 spec:
-  restartPolicy: Never
-  containers:
-  - name: dl-gpu-job
-    image: $dl_image
-    command:
-    - sh
-    - -c
-    args:
-    - export name=$dl_nodes ; 
-      export cpus=$dl_nodes ; 
-      export nodes=$dl_nodes ;
-      export home_path=$container_scope_home ;
-      export data_path=$container_scope_data ;
-      export output_path=$container_scope_output ;
-      export project_path=$container_scope_project ;
-      chown -R $dl_uid:$dl_gid $container_scope_output ;
-      apt-get -y update ;
-      /bin/sh $container_scope_project/$dl_script ;
-      chown -R $dl_uid:$dl_gid $container_scope_output ;
-    resources:
-      requests:
-        cpu: $dl_cpus
-        memory: $dl_memory
-      limits:
-        cpu: $dl_cpus
-        memory: $dl_memory 
-        nvidia.com/gpu: $dl_gpus
-    securityContext:
-      allowPrivilegeEscalation: false    
-    volumeMounts:
-    - name: nfs-output
-      mountPath: $container_scope_output
-    - name: nfs-data
-      mountPath: $container_scope_data
-    - name: nfs-home
-      mountPath: $container_scope_home
-    - mountPath: /dev/shm
-      name: dshm
-  volumes:
-  - name: nfs-output
-    nfs:
-      server: 10.54.182.12
-      path: $dl_scope_output
-      readOnly: false
-  - name: nfs-data
-    nfs:
-      server: 10.54.182.12
-      path: $dl_scope_data
-      readOnly: true
-  - name: nfs-home
-    nfs:
-      server: 10.54.182.12
-      path: $dl_scope_home
-      readOnly: true
-  - name: dshm
-    emptyDir:
-      medium: Memory
-    "
-    else
-
+  runPolicy:
+    ttlSecondsAfterFinished: 120
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          creationTimestamp: null
+        spec:
+          containers:
+            - name: dl-gpu-job
+              image: $dl_image
+              command: ["/bin/sh", "-c"]
+              args:
+                - export name=$dl_name ; 
+                  export cpus=$dl_cpus ; 
+                  export gpus=$dl_gpus ; 
+                  export nodes=$dl_nodes ;
+                  export home_path=$container_scope_home ;
+                  export data_path=$container_scope_data ;
+                  export output_path=$container_scope_output ;
+                  export project_path=$container_scope_project ;
+                  chown -R $dl_uid:$dl_gid $container_scope_output ;
+                  chown -R $dl_uid:$dl_gid $container_scope_project ;
+                  apt-get -y update ;
+                  /bin/sh $container_scope_project/$dl_script ;
+                  chown -R $dl_uid:$dl_gid $container_scope_output ;
+                  chown -R $dl_uid:$dl_gid $container_scope_project ;
+              resources:
+                requests:
+                  cpu: $dl_cpus
+                  memory: $dl_memory
+                  nvidia.com/gpu: $dl_gpus
+                limits:
+                  cpu: $dl_cpus
+                  memory: $dl_memory
+                  nvidia.com/gpu: $dl_gpus
+              securityContext:
+                allowPrivilegeEscalation: false
+              volumeMounts:
+              - name: nfs-output
+                mountPath: $container_scope_output
+              - name: nfs-data
+                mountPath: $container_scope_data
+              - name: nfs-home
+                mountPath: $container_scope_home
+          volumes:
+          - name: nfs-output
+            nfs:
+              server: 10.54.182.12
+              path: $dl_scope_data
+              readOnly: false
+          - name: nfs-data
+            nfs:
+              server: 10.54.182.12
+              path: $dl_scope_data
+              readOnly: true
+          - name: nfs-home
+            nfs:
+              server: 10.54.182.12
+              path: $dl_scope_home
+              readOnly: true
+          - name: dshm
+            emptyDir:
+              medium: Memory"
+    if [[ "$dl_nodes" -gt 1 ]]; then
+    local manifest=$manifest"    
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          creationTimestamp: null
+        spec:
+          containers:
+            - name: dl-gpu-job
+              image: $dl_image
+              command: ["/bin/sh", "-c"]
+              args:
+                - export name=$dl_name ; 
+                  export cpus=$dl_cpus ; 
+                  export gpus=$dl_gpus ; 
+                  export nodes=$dl_nodes ;
+                  export home_path=$container_scope_home ;
+                  export data_path=$container_scope_data ;
+                  export output_path=$container_scope_output ;
+                  export project_path=$container_scope_project ;
+                  chown -R $dl_uid:$dl_gid $container_scope_output ;
+                  chown -R $dl_uid:$dl_gid $container_scope_project ;
+                  apt-get -y update ;
+                  /bin/sh $container_scope_project/$dl_script ;
+                  chown -R $dl_uid:$dl_gid $container_scope_output ;
+                  chown -R $dl_uid:$dl_gid $container_scope_project ;
+              resources:
+                requests:
+                  cpu: $dl_cpus
+                  memory: $dl_memory
+                  nvidia.com/gpu: $dl_gpus
+                limits:
+                  cpu: $dl_cpus
+                  memory: $dl_memory
+                  nvidia.com/gpu: $dl_gpus
+              securityContext:
+                allowPrivilegeEscalation: false
+              volumeMounts:
+              - name: nfs-output
+                mountPath: $container_scope_output
+              - name: nfs-data
+                mountPath: $container_scope_data
+              - name: nfs-home
+                mountPath: $container_scope_home
+          volumes:
+          - name: nfs-output
+            nfs:
+              server: 10.54.182.12
+              path: $dl_scope_output
+              readOnly: false
+          - name: nfs-data
+            nfs:
+              server: 10.54.182.12
+              path: $dl_scope_data
+              readOnly: true
+          - name: nfs-home
+            nfs:
+              server: 10.54.182.12
+              path: $dl_scope_home
+              readOnly: true";
     fi
-    
+
+    echo $manifest
+
     echo $manifest | kubectl create -f -
 }
 
