@@ -1,7 +1,7 @@
 #!/bin/zsh
 #================================================================
 #- IMPLEMENTATION
-#-    version         0.0.7
+#-    version         0.0.6
 #-    author          Maximilian Oppelt
 #-
 #================================================================
@@ -14,7 +14,7 @@
 #                                      Added initial version for new interface.
 #     2022/01/20 : Maximilian Oppelt : Increased shared memory for pytorch dataloader.
 #     2022/01/21 : Maximilian Oppelt : Multi node gpu training for pytorch.
-#     2022/02/04 : Maximilian Oppelt : Minor bug fixes for new cluster interface. 
+#     2022/02/12 : Maximilian Oppelt : Added initialization function for other users.
 #
 #================================================================
 
@@ -33,6 +33,7 @@ function dlh()
     echo "#\tDeleting (old) jobs:      \tdld <JOBNAME>"
     echo "#\tObserving current jobs:   \tdls"
     echo "#\tRemove all jobs:          \tdlda"
+    echo "#\tInitialize the env:       \tdlinit"
     echo "# ===================================================================="
 } 
 
@@ -206,7 +207,7 @@ function dlr() {
     local dl_uid=$(ssh $dl_user@$dl_host 'id -u $dl_user')
     local dl_gid=$(ssh $dl_user@$dl_host 'id -g $dl_user')
     ssh $dl_user@$dl_host "ln -sf $dl_scope_data data; ln -sf $dl_scope_output output; mkdir -p $dl_scope_home/projects"
-    
+
     echo "Creating manifest with configuration: "
     echo "==================================================================="
     echo "USER: $dl_user [UID: $dl_uid / GID: $dl_gid]"
@@ -384,6 +385,63 @@ spec:
     echo $manifest | kubectl create -f -
 }
 
+function dlinit() {
+    local dl_user=$USER
+    local dl_host=dlcluster1scratch.iis.fhg.de
+
+    while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user*|-u*)
+            if [[ "$1" != *=* ]]; then shift; fi
+                local dl_user="${1#*=}"
+            ;;
+    esac
+    shift
+    done
+
+    if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]]; then
+        echo "ERROR: Some or all of the required parameters are empty"
+        cluster_help
+        return 1
+    fi
+    local local_ssh_directory="$HOME/.ssh"
+
+    # Generate rsa files if it does not exist
+    if [[ -f $local_ssh_file/id_rsa ]]
+    then
+        echo "INFO: RSA key exists on $local_ssh_directory/id_rsa, using existing file"
+    else
+        ssh-keygen -t rsa -f "$local_ssh_directory/id_rsa"
+        echo INFO: RSA key pair generated
+    fi
+
+    echo "We need to log into $dl_host as $dl_user to set up your public key."
+    cat "$local_ssh_directory/id_rsa.pub" | ssh "$dl_host" -l "$dl_user" ' [ -d ~/.ssh ] || \
+                                                                mkdir -p ~/.ssh ; \
+                                                                cat > ~/.ssh/KEY ; \
+                                                                KEY=$(cat ~/.ssh/KEY) ; \
+                                                                export KEY ; \
+                                                                grep -q "$KEY" ~/.ssh/authorized_keys || \
+                                                                cat ~/.ssh/KEY >> .ssh/authorized_keys ; \
+                                                                chmod 700 ~/.ssh ; \
+                                                                chmod 600 ~/.ssh/authorized_keys ;
+                                                                rm ~/.ssh/KEY'
+    id_rsa_transfer_status=$?
+
+    if [[ $id_rsa_transfer_status -eq 0 ]]; then
+        echo "INFO: SSH set up complete: [HOST: $dl_host]"
+    else
+        echo "ERROR: SSH setup failed."
+        return 1
+    fi
+
+    # Create project directory
+    ssh $dl_user@$dl_host 'mkdir projects'
+    ssh $dl_user@$dl_host 'touch .hushlogin'
+    ssh $dl_user@$dl_host "ln -s /scratch/scatch/data/$dl_user/ data"
+    ssh $dl_user@$dl_host "ln -s /scratch/scratch/output/$dl_user/ output"
+    return 0
+}
 
 function cluster_help()
 {

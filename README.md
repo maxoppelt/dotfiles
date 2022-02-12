@@ -4,12 +4,7 @@
 ### The Lazy-Deep-Learner's cluster-function
 Simple script to control a remote kubernetes/deep-learning cluster, without the need of connecting via ssh and manual kubectl control.
 ```
-cluster init
-cluster run <JOBNAME>
-cluster jobs
-cluster logs <KUBECTL-ID>
-cluster delete <KUBECTL-ID>
-cluster clean
+kubectl config set-context --current --namespace=<NAMESPACE>
 ```
 
 ## Installation
