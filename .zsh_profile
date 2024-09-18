@@ -1,11 +1,20 @@
+# Add kubectl environment variable
+export KUBECONFIG=~/.kube/dlcluster2.yaml
+
 # Add '~/bin' to the '$PATH'
 export PATH="$HOME/bin:$PATH";
+
+# Ruby/Jekyll: github pages
+export SDKROOT=$(xcrun --show-sdk-path)
+export PATH="$HOME/.gem/ruby/2.6.0/bin:$PATH";
 
 # Add macports to the '$PATH'
 export PATH="/opt/local/bin:/opt/local/sbin:$PATH";
 
-# >>> conda initialize >>>
-# !! Contents within this block are managed by 'conda init' !!
+# Add latex to the $PATH
+export PATH="/Library/TeX/texbin:$PATH";
+
+# Initilize conda
 __conda_setup="$('/Users/opt/miniconda3/bin/conda' 'shell.zsh' 'hook' 2> /dev/null)"
 if [ $? -eq 0 ]; then
     eval "$__conda_setup"
@@ -17,7 +26,8 @@ else
     fi
 fi
 unset __conda_setup
-# <<< conda initialize <<<
+
+# Add conda to the path
 export PATH="/Users/opt/miniconda3/bin:$PATH"
 
 # Load the zsh dotfiles, and then some:

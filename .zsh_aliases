@@ -1,20 +1,8 @@
-# Set ssh aliases for faster login
-alias sshmed="ssh medisec@r10726.iis.fhg.de"
-
-# Student device in 0R2.04 - Linux GTX 1660 Ti
-alias sshlin="ssh opt@r10393.iis.fhg.de"
-
-# Windows workstation in 0R2.05 - Windows
-alias sshiis="ssh opt@ip3346.iis.fhg.de"
-
 # Cluster environment
 alias sshdlc="ssh opt@dlcluster1scratch.iis.fhg.de"
 
-# Deprecated Deep Learning Cluster
-# alias sshdlc="ssh opt@dlcluster1head.iis.fhg.de"
-
-# Home PC
-alias sshpc="ssh max@DESKTOP-SOEQRA2"
+# Deep Learning workstaiton - 4 * H100 (will be part of rancher)
+alias sshdlx="ssh opt@dlcluster2g23.iis.fhg.de"
 
 # Deep Learning workstations - Linux RTX 3090 24 GB
 alias sshdl1="ssh opt@r10973.iis.fhg.de"
@@ -23,6 +11,9 @@ alias sshdl3="ssh opt@r10975.iis.fhg.de"
 alias sshdl4="ssh opt@r10976.iis.fhg.de"
 alias sshdl5="ssh opt@r10977.iis.fhg.de"
 
+# Deep Learning workstaion - Linux RTX 4090 24 GB
+alias sshdlo="ssh opt@r12189.iis.fhg.de"
+
 # Docker is not free anymore
 alias docker='podman'
 
@@ -30,6 +21,8 @@ alias docker='podman'
 alias sudo='sudo '
 
 alias ll='ls -lath'
+
+alias b='bpytop'
 
 # Stopwatch
 alias timer='echo "Timer started. Stop with Ctrl-D." && date && time cat && date'
@@ -65,6 +58,6 @@ alias cleanup="find . -type f -name '*.DS_Store' -ls -delete"
 alias afk="/System/Library/CoreServices/Menu\ Extras/User.menu/Contents/Resources/CGSession -suspend"
 
 # Speedtest-CLI
-alias ispeed="/opt/miniconda3/bin/python /opt/local/bin/speedtest-cli"
+alias ispeed="python /opt/local/bin/speedtest-cli"
 alias reload="exec $SHELL -l"
 

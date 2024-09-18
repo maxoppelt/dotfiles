@@ -43,6 +43,11 @@ if [ $? -eq 0 ]; then
     }
 fi;
 
+# Merge pdfs using ghostscript
+function cpdf () { 
+  gs -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -sOutputFile="$1" "${@:2}"
+}
+
 # Compare original and gzipped file size
 function gz() {
     local origsize=$(wc -c < "$1");
