@@ -14,21 +14,18 @@ export PATH="/opt/local/bin:/opt/local/sbin:$PATH";
 # Add latex to the $PATH
 export PATH="/Library/TeX/texbin:$PATH";
 
-# Initilize conda
-__conda_setup="$('/Users/opt/miniconda3/bin/conda' 'shell.zsh' 'hook' 2> /dev/null)"
-if [ $? -eq 0 ]; then
-    eval "$__conda_setup"
-else
-    if [ -f "/Users/opt/miniconda3/etc/profile.d/conda.sh" ]; then
-        . "/Users/opt/miniconda3/etc/profile.d/conda.sh"
-    else
-        export PATH="/Users/opt/miniconda3/bin:$PATH"
-    fi
+# Pyenv Home
+export PYENV_ROOT="$HOME/.local/share/pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+if type pyenv > /dev/null; then
+    eval "$(pyenv init -)"
+#    # Attention: https://github.com/pyenv/pyenv-virtualenv/issues/259
+#    # eval "$(pyenv virtualenv-init -)"
 fi
-unset __conda_setup
 
-# Add conda to the path
-export PATH="/Users/opt/miniconda3/bin:$PATH"
+# Peotry installation path
+export POETRY_HOME=$HOME/.local/share/poetry
+[[ -d $POETRY_HOME/bin ]] && export PATH="$POETRY_HOME/bin:$PATH"
 
 # Load the zsh dotfiles, and then some:
 for file in ~/.{zsh_aliases,zsh_functions,zsh_cluster,zsh_secrets}; do
