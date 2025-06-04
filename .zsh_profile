@@ -1,31 +1,78 @@
-# Add kubectl environment variable
-export KUBECONFIG=~/.kube/dlcluster2.yaml
-
 # Add '~/bin' to the '$PATH'
-export PATH="$HOME/bin:$PATH";
-
-# Ruby/Jekyll: github pages
-export SDKROOT=$(xcrun --show-sdk-path)
-export PATH="$HOME/.gem/ruby/2.6.0/bin:$PATH";
-
-# Add macports to the '$PATH'
-export PATH="/opt/local/bin:/opt/local/sbin:$PATH";
-
-# Add latex to the $PATH
-export PATH="/Library/TeX/texbin:$PATH";
-
-# Pyenv Home
-export PYENV_ROOT="$HOME/.local/share/pyenv"
-[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
-if type pyenv > /dev/null; then
-    eval "$(pyenv init -)"
-#    # Attention: https://github.com/pyenv/pyenv-virtualenv/issues/259
-#    # eval "$(pyenv virtualenv-init -)"
+if [[ -d "$HOME/bin" ]]; then
+    export PATH="$HOME/bin:$PATH"
 fi
 
-# Peotry installation path
-export POETRY_HOME=$HOME/.local/share/poetry
-[[ -d $POETRY_HOME/bin ]] && export PATH="$POETRY_HOME/bin:$PATH"
+# Check if the system is macOS or Linux
+if [[ "$(uname)" == "Darwin" ]]; then
+    if type port > /dev/null 2>&1; then
+        export LDFLAGS="-L/opt/local/lib/"
+        export CPPFLAGS="-I/opt/local/include -L/opt/local/lib"
+        export C_INCLUDE_PATH="/opt/local/include"
+        export LIBRARY_PATH="/opt/local/lib"
+    fi
+
+    # Ruby/Jekyll: GitHub pages
+    export SDKROOT="$(xcrun --show-sdk-path)"
+    export PATH="$HOME/.gem/ruby/2.6.0/bin:$PATH"
+
+    # Add macports to the '$PATH'
+    export PATH="/opt/local/bin:/opt/local/sbin:$PATH"
+
+    # Add latex to the '$PATH'
+    export PATH="/Library/TeX/texbin:$PATH"
+
+    # Pyenv Home
+    export PYENV_ROOT="$HOME/.local/share/pyenv"
+
+    # Poetry installation path
+    export POETRY_HOME="$HOME/.local/share/poetry"
+    [[ -d "$POETRY_HOME/bin" ]] && export PATH="$POETRY_HOME/bin:$PATH"
+
+elif [[ "$(uname)" == "Linux" ]]; then
+    if [[ -d "/local/$USER" ]]; then
+        export USER_LOCAL="/local/$USER"
+    else
+        export USER_LOCAL="$HOME"
+    fi
+
+    # nvcc versions
+    export CUDA_PATH="/usr/local/cuda/bin"
+    export PYTORCH_NVCC="$CUDA_PATH/nvcc"
+    export PATH="$CUDA_PATH:$PATH"
+
+    if ! gio mount -l | grep -q 'files05'; then
+        gio mount smb://files05.iis.fhg.de/dhs-mda/ < "$HOME/.servercreds" &> /dev/null
+        ln -s "$XDG_RUNTIME_DIR/gvfs/smb-share:server=files05.iis.fhg.de,share=dhs-mda" "$USER_LOCAL/mnt/files-05-dhs-mda" &> /dev/null
+        ln -s "$XDG_RUNTIME_DIR/gvfs/smb-share:server=files05.iis.fhg.de,share=dhs-mda/users/opt/data/" "$USER_LOCAL/data/.cache" &> /dev/null
+    fi
+
+    # The next line updates PATH for the Google Cloud SDK.
+    if [[ -f "$USER_LOCAL/google-cloud-sdk/path.bash.inc" ]]; then
+        source "$USER_LOCAL/google-cloud-sdk/path.bash.inc"
+    fi
+
+    # The next line enables shell command completion for Google Cloud.
+    if [[ -f "$USER_LOCAL/google-cloud-sdk/completion.bash.inc" ]]; then
+        source "$USER_LOCAL/google-cloud-sdk/completion.bash.inc"
+    fi
+
+    # Add pyenv
+    export PYENV_ROOT="$USER_LOCAL/.local/share/pyenv"
+
+else
+    echo "Unknown operating system, could not completely initialize .zsh_profile."
+fi
+
+[[ -d "$PYENV_ROOT/bin" ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+if type pyenv > /dev/null 2>&1; then
+    eval "$(pyenv init -)"
+    # Attention: https://github.com/pyenv/pyenv-virtualenv/issues/259
+    # eval "$(pyenv virtualenv-init -)"
+    if [[ -z "$PYENV_VERSION" ]]; then
+        pyenv activate dev
+    fi
+fi
 
 # Load the zsh dotfiles, and then some:
 for file in ~/.{zsh_aliases,zsh_functions,zsh_cluster,zsh_secrets}; do
