@@ -45,3 +45,13 @@ alias afk="/System/Library/CoreServices/Menu\ Extras/User.menu/Contents/Resource
 alias ispeed="python /opt/local/bin/speedtest-cli"
 alias reload="exec $SHELL -l"
 
+# Clean Podman
+alias podman-clean='podman container prune -f ; podman image prune -f ; podman volume prune -f '
+
+# Nvidia Monitoring
+alias ns="watch -n 1 -d nvidia-smi"
+alias ts="watch -n 1 -d sensors"
+
+# Clean Wandb Cache
+alias wandb-clean='wandb artifact cache cleanup 0'
+
