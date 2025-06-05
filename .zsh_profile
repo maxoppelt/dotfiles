@@ -32,7 +32,10 @@ if [[ "$(uname)" == "Darwin" ]]; then
 elif [[ "$(uname)" == "Linux" ]]; then
     if [[ -d "/local/$USER" ]]; then
         export USER_LOCAL="/local/$USER"
-        cd $USER_LOCAL
+	if [[ "$(pwd)" == "$HOME" ]]; then
+		cd $USER_LOCAL
+	fi
+	alias cdo="cd $USER_LOCAL"
     else
         export USER_LOCAL="$HOME"
     fi
