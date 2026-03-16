@@ -1,7 +1,7 @@
-#!/bin/zsh
+#!/bin/bash
 #================================================================
 #- IMPLEMENTATION
-#-    version         0.0.8
+#-    version         0.1.1
 #-    author          Maximilian Oppelt
 #-
 #================================================================
@@ -18,471 +18,1091 @@
 #     2024/03/19 : Maximilian Oppelt : Updated pytorch docker version.
 #     2024/03/20 : Maximilian Oppelt : Project files are now moved to the container
 #                                      workspace and deleted after the job.
+#     2026/03/09 : Maximilian Oppelt : Fixed several issues in:
+#                                      - dlr():
+#                                        - Duplicate short flag -i* Used for --image, --accelerator, AND --script
+#                                        - NFS path bug: Both nfs-output and nfs-data mount $dl_scope_data
+#                                        - Unused volume: dshm volume defined but never mounted
+#                                      - dll():
+#                                        - Wrong condition: if [[ $watch ]] is always true (should be [[ $watch -eq 1 ]])
+#                                      - dinit():
+#                                        - Typo: local_ssh_file vs local_ssh_directory
+#                                        - Typo: /scratch/scatch/data/ → /scratch/scratch/data/a
+#     2026/03/09 : Maximilian Oppelt : Major refactor with namespace support, TTL cleanup,
+#                                      kubeconfig handling, context management, and improved
+#                                      error handling based on official cluster documentation.
+#     2026/03/09 : Maximilian Oppelt : Updated NFS server to hostname, new default PyTorch image,
+#                                      improved dlinit with kubeconfig/namespace checks,
+#                                      better SSH key handling (supports ed25519/rsa).
 #
 #================================================================
 
-function dlh()
-{
-    echo "# ===================================================================="
-    echo "#  COLLECTION OF LAZY DEEP LEARNER CLUSTER SCRIPT"
-    echo "# ===================================================================="
-    echo "# These functions simplify the managment (starting/stopping/observing)"
-    echo "# of deep learning jobs on the SSE deep learning cluster."
-    echo "#"
-    echo "#  USAGE"
-    echo "# ===================================================================="
-    echo "#\tCreating a new job:       \tdlr <SCRIPT>"
-    echo "#\tPrinting log of job:      \tdll <JOBNAME>"
-    echo "#\tDeleting (old) jobs:      \tdld <JOBNAME>"
-    echo "#\tObserving current jobs:   \tdls"
-    echo "#\tRemove all jobs:          \tdlda"
-    echo "#\tInitialize the env:       \tdlinit"
-    echo "# ===================================================================="
-} 
+# ======================== CONSTANTS ============================
+
+readonly DL_HOST_DEFAULT="dlcluster1scratch.iis.fhg.de"
+readonly DL_IMAGE_DEFAULT="ghcr.io/maxoppelt/pytorch-cm_60:2.7.1"
+readonly DL_ACCELERATOR_DEFAULT="Tesla-P100-SXM2-16GB"
+readonly NFS_SERVER="10.54.182.12"
+readonly DL_TTL_DEFAULT=3600  # 1 hour after completion
+
+# User-configurable (can be set in .zshrc)
+
+: "${DL_NAMESPACE:=}"
+: "${DL_KUBECONFIG:=$HOME/.kube/config}"
+
+# ======================== KUBECTL WRAPPER ======================
+
+function _kubectl() {
+    local cmd="kubectl"
+    
+    if ! command -v kubectl &>/dev/null; then
+        if command -v kubectl1.35 &>/dev/null; then
+            cmd="kubectl1.35"
+        else
+            echo "ERROR: kubectl not found. Install from https://kubernetes.io/docs/tasks/tools/" >&2
+            return 1
+        fi
+    fi
+    
+    local args=()
+    
+    if [[ -n "$DL_KUBECONFIG" && -f "$DL_KUBECONFIG" ]]; then
+        args+=(--kubeconfig "$DL_KUBECONFIG")
+    fi
+    
+    if [[ -n "$DL_NAMESPACE" ]]; then
+        args+=(--namespace "$DL_NAMESPACE")
+    fi
+    
+    $cmd "${args[@]}" "$@"
+}
+
+# ======================== STATUS ===============================
+
+function dlstatus() {
+    echo "=== DL Cluster Status ==="
+    echo ""
+    
+    echo "Configuration:"
+    echo "  DL_NAMESPACE:   ${DL_NAMESPACE:-<not set>}"
+    echo "  DL_KUBECONFIG:  ${DL_KUBECONFIG:-<not set>}"
+    echo ""
+    
+    if [[ -f "${DL_KUBECONFIG:-$HOME/.kube/config}" ]]; then
+        echo "Kubectl Connection Test:"
+        if _kubectl cluster-info &>/dev/null; then
+            echo "  ✓ Connected to cluster"
+            echo ""
+            echo "Current Context:"
+            _kubectl config current-context 2>/dev/null | sed 's/^/  /'
+        else
+            echo "  ✗ Cannot connect to cluster"
+        fi
+    else
+        echo "  ✗ Kubeconfig file not found"
+    fi
+    echo ""
+}
+
+# ======================== HELP =================================
+
+function dlh() {
+    cat <<'EOF'
+╔════════════════════════════════════════════════════════════════════╗
+║           DEEP LEARNING CLUSTER HELPER FUNCTIONS                   ║
+╠════════════════════════════════════════════════════════════════════╣
+║  CONFIGURATION (set in .zshrc or before commands):                 ║
+║    export DL_NAMESPACE="oe-12345"     # Your team namespace        ║
+║    export DL_KUBECONFIG="~/.kube/config"  # Kubeconfig path        ║
+╠════════════════════════════════════════════════════════════════════╣
+║  COMMANDS:                                                         ║
+║    dlr <SCRIPT> [OPTIONS]   Start a new job                        ║
+║    dls [-w] [-j]            List pods/jobs (-j for jobs)           ║
+║    dll <NAME> [-w]          View logs (-w for follow)              ║
+║    dld <NAME>               Delete a job                           ║
+║    dlda                     Delete all jobs (with confirmation)    ║
+║    dli <NAME>               Inspect/describe a pod                 ║
+║    dle [NAME]               View events (optionally for a pod)     ║
+║    dlt <NAME>               Show resource usage (top)              ║
+║    dlctx [CONTEXT]          Switch/show kubectl context            ║
+║    dlns [NAMESPACE]         Switch/show namespace                  ║
+║    dlstatus                 Show current configuration status      ║
+║    dlinit [-u USER]         Initialize SSH and environment         ║
+║    dlh                      Show this help                         ║
+╠════════════════════════════════════════════════════════════════════╣
+║  dlr OPTIONS:                                                      ║
+║    -u, --user USER          Username (default: $USER)              ║
+║    -n, --nodes N            Number of nodes (default: 1)           ║
+║    -g, --gpus N             GPUs per node (default: 1, max: 4)     ║
+║    -c, --cpus N             CPUs per node (default: 8)             ║
+║    -m, --memory SIZE        Memory (default: 12G)                  ║
+║    -M, --memory-limit SIZE  Memory limit (default: same as -m)     ║
+║    -i, --image IMAGE        Docker image                           ║
+║    -a, --accelerator TYPE   GPU type                               ║
+║    -s, --script SCRIPT      Script to run (default: run.sh)        ║
+║    -p, --project NAME       Project name (default: directory name) ║
+║    -t, --ttl SECONDS        TTL after completion (default: 3600)   ║
+║    --no-cleanup             Don't delete project files after job   ║
+║    --no-git                 Don't require git repository           ║
+║    --secret NAME            imagePullSecret for private registry   ║
+╚════════════════════════════════════════════════════════════════════╝
+EOF
+}
+
+# ======================== CONTEXT MANAGEMENT ===================
+
+function dlctx() {
+    local context="$1"
+    
+    if [[ -z "$context" ]]; then
+        echo "Available contexts:"
+        _kubectl config get-contexts
+        return 0
+    fi
+    
+    _kubectl config use-context "$context" && \
+        echo "INFO: Switched to context '$context'"
+}
+
+function dlns() {
+    local namespace="$1"
+    
+    if [[ -z "$namespace" ]]; then
+        if [[ -n "$DL_NAMESPACE" ]]; then
+            echo "Current namespace: $DL_NAMESPACE"
+        else
+            echo "No namespace set. Using default from context."
+            echo "Set with: export DL_NAMESPACE=\"your-namespace\""
+        fi
+        return 0
+    fi
+    
+    export DL_NAMESPACE="$namespace"
+    echo "INFO: Namespace set to '$namespace'"
+}
+
+# ======================== LIST =================================
+
+function dls() {
+    local watch=0
+    local show_jobs=0
+    local show_labels=0
+    local label_selector=""
+    local status_filter=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -w|--watch)    watch=1 ;;
+            -j|--jobs)     show_jobs=1 ;;
+            -l|--labels)   show_labels=1 ;;
+            --label=*)     label_selector="${1#*=}" ;;
+            --status=*)    status_filter="${1#*=}" ;;
+            -*)            echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+        shift
+    done
+    
+    local cmd_args=(-o wide)
+    [[ $watch -eq 1 ]] && cmd_args+=(-w)
+    [[ $show_labels -eq 1 ]] && cmd_args+=(--show-labels)
+    [[ -n "$label_selector" ]] && cmd_args+=(-l "$label_selector")
+    [[ -n "$status_filter" ]] && cmd_args+=(--field-selector "status.phase==$status_filter")
+    
+    if [[ $show_jobs -eq 1 ]]; then
+        echo "=== Jobs ==="
+        _kubectl get jobs "${cmd_args[@]}"
+        echo ""
+        echo "=== PyTorchJobs ==="
+        _kubectl get pytorchjobs "${cmd_args[@]}" 2>/dev/null || echo "(none)"
+    else
+        [[ $watch -eq 1 ]] && echo "INFO: Watching pods. Press Ctrl+C to stop."
+        _kubectl get pods "${cmd_args[@]}"
+    fi
+}
+
+# ======================== LOG ==================================
 
 function dll() {
     local name=""
     local watch=0
+    local label=""
+    local container=""
+    local previous=0
+    
     while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -w)
-            watch=1
-            ;;
-        *)
-            name="${1}"
-        ;;
-    esac
-    shift
+        case "$1" in
+            -w|--watch)      watch=1 ;;
+            -l|--label)      shift; label="$1" ;;
+            -c|--container)  shift; container="$1" ;;
+            -p|--previous)   previous=1 ;;
+            -*)              echo "Unknown option: $1" >&2; return 1 ;;
+            *)               name="$1" ;;
+        esac
+        shift
     done
-    if ! [[ $name ]]; then
-        echo "ERROR: No job name provided."
+    
+    local cmd_args=()
+    [[ $watch -eq 1 ]] && cmd_args+=(-f)
+    [[ $previous -eq 1 ]] && cmd_args+=(-p)
+    [[ -n "$container" ]] && cmd_args+=(-c "$container")
+    
+    if [[ -n "$label" ]]; then
+        _kubectl logs -l "$label" "${cmd_args[@]}"
+    elif [[ -n "$name" ]]; then
+        _kubectl logs "$name" "${cmd_args[@]}"
+    else
+        echo "ERROR: Provide job name or use -l for label selector" >&2
         return 1
     fi
+}
 
-    if [[ $watch ]]; then
-        kubectl logs -f $name
+# ======================== EVENTS ===============================
+
+function dle() {
+    local name="$1"
+    local sort_by="--sort-by=.metadata.creationTimestamp"
+    
+    if [[ -n "$name" ]]; then
+        echo "=== Events for $name ==="
+        _kubectl get events "$sort_by" --field-selector "involvedObject.name=$name"
     else
-        kubectl logs $name
+        echo "=== Recent Events ==="
+        _kubectl get events "$sort_by" | tail -20
     fi
 }
 
-function dlda() {
-    echo "Are you sure? Do you want to delete these jobs:"
-    kubectl get pods -o wide
-    select yn in "Yes" "No"; do
-    case $yn in
-        Yes ) kubectl delete --all pods ; return ;;
-        No ) return ;;
-    esac
-    done
+# ======================== TOP ==================================
+
+function dlt() {
+    local name="$1"
+    
+    if [[ -n "$name" ]]; then
+        _kubectl top pod "$name"
+    else
+        _kubectl top pod
+    fi
 }
 
-function dld() {
-    local name=""
-    if [[ "${1}" ]]; then
-        name="${1}"
-        name="${name//-master-0/}"
-    else
-        echo "ERROR: No job name provided."
-        return 1
-    fi
-    kubectl delete PyTorchJob $name
-}
+# ======================== INSPECT ==============================
 
 function dli() {
-    local name=""
-    if [[ "${1}" ]]; then
-        name="${1}"
-        name="${name//-master-0/}"
-    else
-        echo "ERROR: No job name provided."
+    local name="${1:-}"
+    local output_format="${2:-}"
+    
+    if [[ -z "$name" ]]; then
+        echo "ERROR: No pod name provided." >&2
+        echo "Usage: dli <POD_NAME> [yaml|json]" >&2
         return 1
     fi
-    kubectl describe pod $name
-}
-
-function dls() {
-    watch=0 
-    while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -w)
-            watch=1
-            ;;
-    esac
-    shift
-    done
-
-    # Show all running kubectl jobs (either once or live)
-    if [[ "$watch" = 1 ]]; then
-        echo "INFO: Interrupt with Ctrl+C."
-        kubectl get pods -w -o wide
+    
+    local base_name="${name//-master-0/}"
+    base_name="${base_name//-worker-*/}"
+    
+    if [[ -n "$output_format" ]]; then
+        _kubectl get pod "$name" -o "$output_format"
     else
-        kubectl get pods -o wide
+        echo "=== Pod Description ==="
+        _kubectl describe pod "$name"
+        echo ""
+        echo "=== Recent Events ==="
+        dle "$name"
     fi
 }
 
-function dlr() {
-    # Create manifest file, Sync 
-    # For the new compute cluster the interface changed.
-    local dl_user=$USER
-    local dl_host=dlcluster1scratch.iis.fhg.de
-    local dl_name=""
+# ======================== DELETE ===============================
 
+function dld() {
+    local name="${1:-}"
+    
+    if [[ -z "$name" ]]; then
+        echo "ERROR: No job name provided." >&2
+        echo "Usage: dld <JOB_NAME>" >&2
+        return 1
+    fi
+    
+    local base_name="${name//-master-0/}"
+    base_name="${base_name//-worker-*/}"
+    
+    echo "Deleting job: $base_name"
+    
+    if ! _kubectl delete pytorchjob "$base_name" 2>/dev/null; then
+        if ! _kubectl delete job "$base_name" 2>/dev/null; then
+            echo "WARN: No PyTorchJob or Job found. Trying to delete pod directly..."
+            _kubectl delete pod "$name"
+        fi
+    fi
+}
+
+# ======================== DELETE ALL ===========================
+
+function dlda() {
+    echo "=== Current Jobs ==="
+    _kubectl get jobs -o wide 2>/dev/null
+    _kubectl get pytorchjobs -o wide 2>/dev/null
+    echo ""
+    echo "=== Current Pods ==="
+    _kubectl get pods -o wide
+    echo ""
+    
+    echo "Are you sure you want to delete ALL jobs?"
+    select yn in "Yes" "No"; do
+        case $yn in
+            Yes)
+                echo "Deleting PyTorchJobs..."
+                _kubectl delete pytorchjobs --all 2>/dev/null
+                echo "Deleting Jobs..."
+                _kubectl delete jobs --all 2>/dev/null
+                echo "Done."
+                return
+                ;;
+            No)
+                echo "Cancelled."
+                return
+                ;;
+        esac
+    done
+}
+
+# ======================== HELPER: Generate container spec ======
+
+# FIXED: Removed blank lines that caused invalid YAML
+
+function _generate_container_spec() {
+    local role="$1"
+    local dl_image="$2"
+    local dl_cpus="$3"
+    local dl_gpus="$4"
+    local dl_nodes="$5"
+    local dl_name="$6"
+    local dl_memory="$7"
+    local dl_memory_limit="$8"
+    local container_scope_home="$9"
+    local container_scope_data="${10}"
+    local container_scope_output="${11}"
+    local container_scope_project="${12}"
+    local dl_script="${13}"
+    local dl_uid="${14}"
+    local dl_gid="${15}"
+    local cleanup_project="${16:-true}"
+
+    local cleanup_cmd=""
+    [[ "$cleanup_project" == "true" ]] && cleanup_cmd="rm -Rf $container_scope_project ;"
+
+    cat <<EOF
+            - name: pytorch
+
+              image: $dl_image
+              env:
+                - name: NUM_CPUS
+
+                  value: "$dl_cpus"
+                - name: NUM_GPUS
+
+                  value: "$dl_gpus"
+                - name: NUM_NODES
+
+                  value: "$dl_nodes"
+                - name: NAME
+
+                  value: "$dl_name"
+                - name: HOME_PATH
+
+                  value: "$container_scope_home"
+                - name: DATA_PATH
+
+                  value: "$container_scope_data"
+                - name: OUTPUT_PATH
+
+                  value: "$container_scope_output"
+                - name: PROJECT_PATH
+
+                  value: "$container_scope_project"
+                - name: NVIDIA_DISABLE_REQUIRE
+
+                  value: "true"
+              command: ["/bin/bash", "-c"]
+              args:
+                - set -e ;
+
+                  cp -Rf $container_scope_project/* /workspace/ 2>/dev/null || true ;
+                  cd /workspace ;
+                  /bin/bash ./$dl_script ;
+                  chown -R $dl_uid:$dl_gid $container_scope_data 2>/dev/null || true ;
+                  chown -R $dl_uid:$dl_gid $container_scope_output 2>/dev/null || true ;
+                  $cleanup_cmd
+              resources:
+                requests:
+                  cpu: $dl_cpus
+                  memory: $dl_memory
+                limits:
+                  cpu: $dl_cpus
+                  memory: $dl_memory_limit
+                  nvidia.com/gpu: $dl_gpus
+              securityContext:
+                allowPrivilegeEscalation: false
+              volumeMounts:
+                - name: nfs-output
+
+                  mountPath: $container_scope_output
+                - name: nfs-data
+
+                  mountPath: $container_scope_data
+                - name: nfs-home
+
+                  mountPath: $container_scope_home
+                - name: dshm
+
+                  mountPath: /dev/shm
+EOF
+}
+
+# ======================== HELPER: Generate volumes spec ========
+
+# FIXED: Removed blank lines that caused invalid YAML
+
+function _generate_volumes_spec() {
+    local dl_scope_home="$1"
+    local dl_scope_data="$2"
+    local dl_scope_output="$3"
+
+    cat <<EOF
+          volumes:
+            - name: nfs-output
+
+              nfs:
+                server: $NFS_SERVER
+                path: $dl_scope_output
+                readOnly: false
+            - name: nfs-data
+
+              nfs:
+                server: $NFS_SERVER
+                path: $dl_scope_data
+                readOnly: false
+            - name: nfs-home
+
+              nfs:
+                server: $NFS_SERVER
+                path: $dl_scope_home
+                readOnly: false
+            - name: dshm
+
+              emptyDir:
+                medium: Memory
+                sizeLimit: 8Gi
+EOF
+}
+
+# ======================== RUN ==================================
+
+function dlr() {
+    local dl_user="$USER"
+    local dl_host="$DL_HOST_DEFAULT"
     local dl_nodes=1
     local dl_gpus=1
     local dl_cpus=8
-    local dl_memory=12G
-
-    local dl_image=pytorch/pytorch:2.2.1-cuda12.1-cudnn8-devel
-    local dl_accelerator=Tesla-P100-SXM2-16GB
-    # nvidia.com/gpu.product=Tesla-P40
-    # nvidia.com/gpu.product=Tesla-P100-SXM2-16GB
-    local dl_script=run.sh
+    local dl_memory="12Gi"
+    local dl_memory_limit=""
+    local dl_image="$DL_IMAGE_DEFAULT"
+    local dl_accelerator="$DL_ACCELERATOR_DEFAULT"
+    local dl_script="run.sh"
+    local dl_project=""
+    local dl_ttl="$DL_TTL_DEFAULT"
+    local cleanup_project="true"
+    local image_pull_secret=""
+    local dry_run=0
+    local require_git=1  # NEW: default to requiring git, can disable
 
     while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --user*|-u*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_user="${1#*=}"
-            ;;
-
-        --host*|-s*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_host="${1#*=}"
-            ;;
-
-        --nodes*|-n*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_nodes="${1#*=}"
-            ;;
-
-        --gpus*|-g*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_gpus="${1#*=}"
-            ;;
-
-        --cpus*|-c*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_cpus="${1#*=}"
-            ;;
-
-        --memory*|-m*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_memory="${1#*=}"
-            ;;
-
-        --image*|-i*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_image="${1#*=}"
-            ;;
-
-        --accelerator*|-i*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_accelerator="${1#*=}"
-            ;;
-
-        --script*|-i*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_script="${1#*=}"
-            ;;
-        *)
-            dl_script="${1}"
-        ;;
-
-    esac
-    shift
+        case "$1" in
+            --user=*|-u=*)          dl_user="${1#*=}" ;;
+            --user|-u)              shift; dl_user="$1" ;;
+            --host=*|-H=*)          dl_host="${1#*=}" ;;
+            --host|-H)              shift; dl_host="$1" ;;
+            --nodes=*|-n=*)         dl_nodes="${1#*=}" ;;
+            --nodes|-n)             shift; dl_nodes="$1" ;;
+            --gpus=*|-g=*)          dl_gpus="${1#*=}" ;;
+            --gpus|-g)              shift; dl_gpus="$1" ;;
+            --cpus=*|-c=*)          dl_cpus="${1#*=}" ;;
+            --cpus|-c)              shift; dl_cpus="$1" ;;
+            --memory=*|-m=*)        dl_memory="${1#*=}" ;;
+            --memory|-m)            shift; dl_memory="$1" ;;
+            --memory-limit=*|-M=*)  dl_memory_limit="${1#*=}" ;;
+            --memory-limit|-M)      shift; dl_memory_limit="$1" ;;
+            --image=*|-i=*)         dl_image="${1#*=}" ;;
+            --image|-i)             shift; dl_image="$1" ;;
+            --accelerator=*|-a=*)   dl_accelerator="${1#*=}" ;;
+            --accelerator|-a)       shift; dl_accelerator="$1" ;;
+            --script=*|-s=*)        dl_script="${1#*=}" ;;
+            --script|-s)            shift; dl_script="$1" ;;
+            --project=*|-p=*)       dl_project="${1#*=}" ;;
+            --project|-p)           shift; dl_project="$1" ;;
+            --ttl=*|-t=*)           dl_ttl="${1#*=}" ;;
+            --ttl|-t)               shift; dl_ttl="$1" ;;
+            --no-cleanup)           cleanup_project="false" ;;
+            --no-git)               require_git=0 ;;  # NEW: disable git requirement
+            --secret=*)             image_pull_secret="${1#*=}" ;;
+            --secret)               shift; image_pull_secret="$1" ;;
+            --dry-run)              dry_run=1 ;;
+            -*)                     echo "ERROR: Unknown option $1" >&2; return 1 ;;
+            *)                      dl_script="$1" ;;
+        esac
+        shift
     done
 
+    # Validate GPU count
+    if [[ "$dl_gpus" -gt 4 ]]; then
+        echo "ERROR: Maximum 4 GPUs per pod (hardware limit)" >&2
+        return 1
+    fi
+
+    # Set memory limit to memory if not specified
+    [[ -z "$dl_memory_limit" ]] && dl_memory_limit="$dl_memory"
+
+    # Normalize memory format (add 'i' if missing for Gi)
+    [[ "$dl_memory" =~ ^[0-9]+G$ ]] && dl_memory="${dl_memory}i"
+    [[ "$dl_memory_limit" =~ ^[0-9]+G$ ]] && dl_memory_limit="${dl_memory_limit}i"
+
+    # Path configuration
     local dl_scope_home="/scratch/home/$dl_user"
     local dl_scope_data="/scratch/scratch/data/$dl_user"
     local dl_scope_output="/scratch/scratch/output/$dl_user"
-
     local container_scope_home="/home/$dl_user"
     local container_scope_data="/data/$dl_user"
     local container_scope_output="/output/$dl_user"
 
-    local dl_project=${PWD##*/}
-    local dl_name="$dl_project"-"$(date -u +"%Y-%m-%d-%H-%M-%S")"
+    # Determine project name
+    if [[ -z "$dl_project" ]]; then
+        dl_project="${PWD##*/}"
+    fi
+    
+    local dl_name="${dl_project}-$(date -u +"%Y%m%d-%H%M%S")"
+    local dl_scope_project="$dl_scope_home/projects/$dl_name"
+    local container_scope_project="$container_scope_home/projects/$dl_name"
 
-    local dl_scope_project=$dl_scope_home/projects/$dl_name/
-    local container_scope_project=$container_scope_home/projects/$dl_name
-
-    local dl_uid=$(ssh $dl_user@$dl_host 'id -u $dl_user')
-    local dl_gid=$(ssh $dl_user@$dl_host 'id -g $dl_user')
-    ssh $dl_user@$dl_host "ln -sf $dl_scope_data data; ln -sf $dl_scope_output output; mkdir -p $dl_scope_home/projects"
-
-    echo "Creating manifest with configuration: "
-    echo "==================================================================="
-    echo "USER: $dl_user [UID: $dl_uid / GID: $dl_gid]"
-    echo "MOUNTS:"
-    echo "  - $dl_scope_home -> $container_scope_home"
-    echo "  - $dl_scope_data -> $container_scope_data"
-    echo "  - $dl_scope_output -> $container_scope_output"
-    echo "HOST: $dl_host"
-    echo "NODES: $dl_nodes"
-    echo "CPUS: $dl_cpus"
-    echo "GPUS: $dl_gpus"
-    echo "MEMORY: $dl_memory"
-    echo "==================================================================="
-
-    # Syncing local project to deep learning cluster
-    local git_repo="$(git rev-parse --is-inside-work-tree 2>/dev/null)"
-    if [[ "$git_repo" ]]; then
-        if [[ $(git rev-parse --show-toplevel) != $(pwd) ]]; then
-            echo "ERROR: Not in git root directory"
+    # MODIFIED: Git validation is now optional
+    if [[ $require_git -eq 1 ]]; then
+        if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+            echo "ERROR: Not in a git repository." >&2
+            echo "       Use --no-git to run without git requirement." >&2
             return 1
         fi
-    else
-        echo "ERROR: Folder is no git repository. Stop syncing..."
+        if [[ "$(git rev-parse --show-toplevel)" != "$PWD" ]]; then
+            echo "ERROR: Must run from git repository root." >&2
+            echo "       Current: $PWD" >&2
+            echo "       Root:    $(git rev-parse --show-toplevel)" >&2
+            echo "       Use --no-git to run without git requirement." >&2
+            return 1
+        fi
+    fi
+
+    # Validate script exists
+    if [[ ! -f "$dl_script" ]]; then
+        echo "ERROR: Script '$dl_script' not found in current directory." >&2
         return 1
     fi
-    echo "INFO: Synced ${PWD} to $dl_user"@"$dl_host:$dl_scope_home/projects/$dl_name"
-    rsync --exclude '.git' \
-          --exclude 'logs/' \
-          --exclude '__pycache__' \
-          -av --delete \
-          -e ssh ${PWD}/ $dl_user@$dl_host:$dl_scope_home/projects/$dl_name
 
-    # Create/Build kubectl manifest file
+    # Get remote UID/GID
+    echo "INFO: Connecting to $dl_host..."
+    local remote_ids
+    remote_ids=$(ssh "$dl_user@$dl_host" "
+        id -u
+        id -g
+        mkdir -p '$dl_scope_home/projects'
+        mkdir -p '$dl_scope_data'
+        mkdir -p '$dl_scope_output'
+        ln -sf '$dl_scope_data' ~/data 2>/dev/null
+        ln -sf '$dl_scope_output' ~/output 2>/dev/null
+    " 2>/dev/null) || {
+        echo "ERROR: Failed to connect to $dl_host" >&2
+        return 1
+    }
+    
+    local dl_uid dl_gid
+    dl_uid=$(echo "$remote_ids" | sed -n '1p')
+    dl_gid=$(echo "$remote_ids" | sed -n '2p')
+
+    cat <<EOF
+╔════════════════════════════════════════════════════════════════════╗
+║                        JOB CONFIGURATION                           ║
+╠════════════════════════════════════════════════════════════════════╣
+  Name:        $dl_name
+  User:        $dl_user (UID: $dl_uid / GID: $dl_gid)
+  Namespace:   ${DL_NAMESPACE:-<default>}
+  
+  Resources:
+    Nodes: $dl_nodes | CPUs: $dl_cpus | GPUs: $dl_gpus
+    Memory: $dl_memory (limit: $dl_memory_limit)
+    Accelerator: $dl_accelerator
+  
+  Container:
+    Image: $dl_image
+    Script: $dl_script
+    TTL: ${dl_ttl}s after completion
+╚════════════════════════════════════════════════════════════════════╝
+EOF
+
+    # Sync project - MODIFIED: different excludes for non-git
+    echo "INFO: Syncing project to cluster..."
+    local rsync_excludes=(
+        --exclude '.git'
+        --exclude 'logs/'
+        --exclude '__pycache__'
+        --exclude '*.pyc'
+        --exclude '.venv'
+        --exclude 'venv'
+        --exclude '.idea'
+        --exclude '*.egg-info'
+        --exclude 'wandb/'
+        --exclude '.DS_Store'
+        --exclude '*.log'
+    )
+    
+    rsync -az --delete "${rsync_excludes[@]}" \
+          -e ssh "${PWD}/" "$dl_user@$dl_host:$dl_scope_project" || {
+        echo "ERROR: rsync failed" >&2
+        return 1
+    }
+    echo "INFO: Project synced to $dl_scope_project"
+
+    # Build imagePullSecrets if specified
+    local image_pull_secrets_yaml=""
+    if [[ -n "$image_pull_secret" ]]; then
+        image_pull_secrets_yaml="          imagePullSecrets:
+            - name: $image_pull_secret"
+
+    fi
+
+    # Build manifest
     local manifest="---
-apiVersion: \"kubeflow.org/v1\"
+apiVersion: kubeflow.org/v1
 kind: PyTorchJob
 metadata:
   name: $dl_name
+  labels:
+    owner: $dl_user
+    project: $dl_project
 spec:
+  runPolicy:
+    ttlSecondsAfterFinished: $dl_ttl
+    cleanPodPolicy: None
   pytorchReplicaSpecs:
     Master:
       replicas: 1
       restartPolicy: Never
       template:
         metadata:
-          creationTimestamp: null
           labels:
             nvidia.com/gpu.product: $dl_accelerator
+            owner: $dl_user
         spec:
+$image_pull_secrets_yaml
           containers:
-            - name: pytorch
-              image: $dl_image
-              env:
-                - name: \"NUM_CPUS\"
-                  value: \"$dl_cpus\"
-                - name: \"NUM_GPUS\"
-                  value: \"$dl_gpus\"
-                - name: \"NUM_NODES\"
-                  value: \"$dl_nodes\"
-                - name: \"NAME\"
-                  value: \"$dl_name\"
-                - name: \"HOME_PATH\"
-                  value: \"$container_scope_home\"
-                - name: \"DATA_PATH\"
-                  value: \"$container_scope_data\"
-                - name: \"OUTPUT_PATH\"
-                  value: \"$container_scope_output\"
-                - name: \"PROJECT_PATH\"
-                  value: \"$container_scope_project\"
-                - name: NVIDIA_DISABLE_REQUIRE
-                  value: \"true\"
-              command: [\"/bin/sh\", \"-c\"]
-              args:
-                - apt-get -y update ;
-                  echo \$NUM_CPUS ;
-                  echo \$NUM_GPUS ;
-                  echo \$NUM_NODES ;
-                  echo \$NUM_NAME ;
-                  echo \$HOME_PATH ;
-                  echo \$DATA_PATH ;
-                  echo \$OUTPUT_PATH ;
-                  echo \$PROJECT_PATH ;
-                  pwd ;
-                  nvidia-smi ;
-                  cp -Rf $container_scope_project/* /workspace/ ;
-                  /bin/sh /workspace/$dl_script ;
-                  chown -R $dl_uid:$dl_gid $container_scope_data ;
-                  chown -R $dl_uid:$dl_gid $container_scope_output ;
-                  rm -Rf $container_scope_project ;
-              resources:
-                requests:
-                  cpu: $dl_cpus
-                  memory: $dl_memory
-                  nvidia.com/gpu: $dl_gpus
-                limits:
-                  cpu: $dl_cpus
-                  memory: $dl_memory
-                  nvidia.com/gpu: $dl_gpus
-              securityContext:
-                allowPrivilegeEscalation: false
-              volumeMounts:
-              - name: nfs-output
-                mountPath: $container_scope_output
-              - name: nfs-data
-                mountPath: $container_scope_data
-              - name: nfs-home
-                mountPath: $container_scope_home
-          volumes:
-          - name: nfs-output
-            nfs:
-              server: 10.54.182.12
-              path: $dl_scope_data
-              readOnly: false
-          - name: nfs-data
-            nfs:
-              server: 10.54.182.12
-              path: $dl_scope_data
-              readOnly: false
-          - name: nfs-home
-            nfs:
-              server: 10.54.182.12
-              path: $dl_scope_home
-              readOnly: false
-          - name: dshm
-            emptyDir:
-              medium: Memory"
+$(_generate_container_spec Master "$dl_image" "$dl_cpus" "$dl_gpus" "$dl_nodes" "$dl_name" "$dl_memory" "$dl_memory_limit" "$container_scope_home" "$container_scope_data" "$container_scope_output" "$container_scope_project" "$dl_script" "$dl_uid" "$dl_gid" "$cleanup_project")
+$(_generate_volumes_spec "$dl_scope_home" "$dl_scope_data" "$dl_scope_output")"
+
+    # Add worker spec for multi-node
     if [[ "$dl_nodes" -gt 1 ]]; then
-    local manifest=$manifest"
+        manifest+="
     Worker:
-      replicas: 1
+      replicas: $((dl_nodes - 1))
       restartPolicy: Never
       template:
         metadata:
-          creationTimestamp: null
           labels:
             nvidia.com/gpu.product: $dl_accelerator
+            owner: $dl_user
         spec:
+$image_pull_secrets_yaml
           containers:
-            - name: pytorch
-              image: $dl_image
-              env:
-                - name: \"NUM_CPUS\"
-                  value: \"$dl_cpus\"
-                - name: \"NUM_GPUS\"
-                  value: \"$dl_gpus\"
-                - name: \"NUM_NODES\"
-                  value: \"$dl_nodes\"
-                - name: \"NAME\"
-                  value: \"$dl_name\"
-                - name: \"HOME_PATH\"
-                  value: \"$container_scope_home\"
-                - name: \"DATA_PATH\"
-                  value: \"$container_scope_data\"
-                - name: \"OUTPUT_PATH\"
-                  value: \"$container_scope_output\"
-                - name: \"PROJECT_PATH\"
-                  value: \"$container_scope_project\"
-                - name: NVIDIA_DISABLE_REQUIRE
-                  value: \"true\"
-              command: [\"/bin/sh\", \"-c\"]
-              args:
-                - apt-get -y update ;
-                  echo \$NUM_CPUS ;
-                  echo \$NUM_GPUS ;
-                  echo \$NUM_NODES ;
-                  echo \$NUM_NAME ;
-                  echo \$HOME_PATH ;
-                  echo \$DATA_PATH ;
-                  echo \$OUTPUT_PATH ;
-                  echo \$PROJECT_PATH ;
-                  pwd ;
-                  nvidia-smi ;
-                  cp -Rf $container_scope_project/* /workspace/ ;
-                  /bin/sh /workspace/$dl_script ;
-                  chown -R $dl_uid:$dl_gid $container_scope_data ;
-                  chown -R $dl_uid:$dl_gid $container_scope_output ;
-              resources:
-                requests:
-                  cpu: $dl_cpus
-                  memory: $dl_memory
-                  nvidia.com/gpu: $dl_gpus
-                limits:
-                  cpu: $dl_cpus
-                  memory: $dl_memory
-                  nvidia.com/gpu: $dl_gpus
-              securityContext:
-                allowPrivilegeEscalation: false
-              volumeMounts:
-              - name: nfs-output
-                mountPath: $container_scope_output
-              - name: nfs-data
-                mountPath: $container_scope_data
-              - name: nfs-home
-                mountPath: $container_scope_home
-          volumes:
-          - name: nfs-output
-            nfs:
-              server: 10.54.182.12
-              path: $dl_scope_output
-              readOnly: false
-          - name: nfs-data
-            nfs:
-              server: 10.54.182.12
-              path: $dl_scope_data
-              readOnly: false
-          - name: nfs-home
-            nfs:
-              server: 10.54.182.12
-              path: $dl_scope_home
-              readOnly: false
-          - name: dshm
-            emptyDir:
-              medium: Memory";
+$(_generate_container_spec Worker "$dl_image" "$dl_cpus" "$dl_gpus" "$dl_nodes" "$dl_name" "$dl_memory" "$dl_memory_limit" "$container_scope_home" "$container_scope_data" "$container_scope_output" "$container_scope_project" "$dl_script" "$dl_uid" "$dl_gid" false)
+$(_generate_volumes_spec "$dl_scope_home" "$dl_scope_data" "$dl_scope_output")"
     fi
-    echo $manifest | kubectl create -f -
+
+    if [[ $dry_run -eq 1 ]]; then
+        echo ""
+        echo "=== Generated Manifest (dry-run) ==="
+        echo "$manifest"
+        return 0
+    fi
+
+    echo ""
+    echo "INFO: Submitting job to cluster..."
+    echo "$manifest" | _kubectl create -f - || {
+        echo "ERROR: Failed to create job" >&2
+        echo "TIP: Use 'dlr --dry-run' to see the generated manifest" >&2
+        return 1
+    }
+
+    echo ""
+    echo "INFO: Job submitted successfully!"
+    echo "      Monitor with: dls -w"
+    echo "      View logs:    dll $dl_name-master-0 -w"
+    echo "      Delete:       dld $dl_name"
 }
 
+# ======================== HELPER: Find or create SSH key =======
+
+function _get_ssh_key() {
+    local ssh_dir="$HOME/.ssh"
+    local key_file=""
+    
+    if [[ ! -d "$ssh_dir" ]]; then
+        mkdir -p "$ssh_dir"
+        chmod 700 "$ssh_dir"
+    fi
+    
+    if [[ -f "$ssh_dir/id_ed25519" && -f "$ssh_dir/id_ed25519.pub" ]]; then
+        echo "INFO: Found existing Ed25519 key" >&2
+        echo "$ssh_dir/id_ed25519"
+        return 0
+    elif [[ -f "$ssh_dir/id_rsa" && -f "$ssh_dir/id_rsa.pub" ]]; then
+        echo "INFO: Found existing RSA key" >&2
+        echo "$ssh_dir/id_rsa"
+        return 0
+    elif [[ -f "$ssh_dir/id_ed25519" && ! -f "$ssh_dir/id_ed25519.pub" ]]; then
+        echo "INFO: Regenerating public key from existing Ed25519 private key" >&2
+        ssh-keygen -y -f "$ssh_dir/id_ed25519" > "$ssh_dir/id_ed25519.pub" 2>/dev/null || {
+            echo "ERROR: Failed to regenerate public key" >&2
+            return 1
+        }
+        echo "$ssh_dir/id_ed25519"
+        return 0
+    elif [[ -f "$ssh_dir/id_rsa" && ! -f "$ssh_dir/id_rsa.pub" ]]; then
+        echo "INFO: Regenerating public key from existing RSA private key" >&2
+        ssh-keygen -y -f "$ssh_dir/id_rsa" > "$ssh_dir/id_rsa.pub" 2>/dev/null || {
+            echo "ERROR: Failed to regenerate public key" >&2
+            return 1
+        }
+        echo "$ssh_dir/id_rsa"
+        return 0
+    fi
+    
+    echo "" >&2
+    echo "No SSH key found. Which type would you like to generate?" >&2
+    select key_choice in "Ed25519 (recommended)" "RSA" "Cancel"; do
+        case $key_choice in
+            "Ed25519 (recommended)")
+                key_file="$ssh_dir/id_ed25519"
+                echo "INFO: Generating new Ed25519 key..." >&2
+                ssh-keygen -t ed25519 -f "$key_file" -N "" -C "$USER@$(hostname)-dlcluster" || return 1
+                break
+                ;;
+            "RSA")
+                key_file="$ssh_dir/id_rsa"
+                echo "INFO: Generating new RSA key..." >&2
+                ssh-keygen -t rsa -b 4096 -f "$key_file" -N "" -C "$USER@$(hostname)-dlcluster" || return 1
+                break
+                ;;
+            "Cancel")
+                return 1
+                ;;
+        esac
+    done
+    
+    echo "INFO: Key generated: $key_file" >&2
+    echo "$key_file"
+}
+
+# ======================== HELPER: Validate kubeconfig ==========
+
+function _validate_kubeconfig() {
+    local config_file="$1"
+    
+    if [[ ! -f "$config_file" ]]; then
+        return 1
+    fi
+    
+    if grep -q "^kind: Config" "$config_file" 2>/dev/null || \
+       (grep -q "clusters:" "$config_file" && grep -q "users:" "$config_file") 2>/dev/null; then
+        return 0
+    fi
+    
+    local kind=$(grep "^kind:" "$config_file" 2>/dev/null | head -1 | awk '{print $2}')
+    if [[ -n "$kind" && "$kind" != "Config" ]]; then
+        echo "WARNING: File appears to be a '$kind' resource, not a kubeconfig" >&2
+        return 2
+    fi
+    
+    return 1
+}
+
+# ======================== INIT =================================
+
 function dlinit() {
-    local dl_user=$USER
-    local dl_host=dlcluster1scratch.iis.fhg.de
+    local dl_user="$USER"
+    local dl_host="$DL_HOST_DEFAULT"
+    local skip_ssh=0
+    local skip_kubeconfig=0
 
     while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --user*|-u*)
-            if [[ "$1" != *=* ]]; then shift; fi
-                local dl_user="${1#*=}"
-            ;;
-    esac
-    shift
+        case "$1" in
+            --user=*|-u=*)      dl_user="${1#*=}" ;;
+            --user|-u)          shift; dl_user="$1" ;;
+            --host=*|-H=*)      dl_host="${1#*=}" ;;
+            --host|-H)          shift; dl_host="$1" ;;
+            --skip-ssh)         skip_ssh=1 ;;
+            --skip-kubeconfig)  skip_kubeconfig=1 ;;
+        esac
+        shift
     done
 
-    if [[ -z "$dl_user" ]] || [[ -z "$dl_host" ]]; then
-        echo "ERROR: Some or all of the required parameters are empty"
-        cluster_help
-        return 1
-    fi
-    local local_ssh_directory="$HOME/.ssh"
+    echo "╔════════════════════════════════════════════════════════════════════╗"
+    echo "║              DL CLUSTER INITIALIZATION                             ║"
+    echo "╚════════════════════════════════════════════════════════════════════╝"
+    echo ""
 
-    # Generate rsa files if it does not exist
-    if [[ -f $local_ssh_file/id_rsa ]]
-    then
-        echo "INFO: RSA key exists on $local_ssh_directory/id_rsa, using existing file"
+    # ==================== SSH KEY SETUP ====================
+    if [[ $skip_ssh -eq 0 ]]; then
+        echo "=== Step 1: SSH Key Setup ==="
+        echo ""
+        
+        local key_file
+        key_file=$(_get_ssh_key) || {
+            echo "ERROR: SSH key setup cancelled or failed" >&2
+            return 1
+        }
+        
+        echo "  Using key: $key_file"
+        echo "  Public key: ${key_file}.pub"
+        echo ""
+        
+        echo "  Testing SSH connection to $dl_host..."
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 "$dl_user@$dl_host" "echo ok" &>/dev/null; then
+            echo "  ✓ SSH key already authorized on $dl_host"
+        else
+            echo "  Copying SSH key to $dl_host (you may be prompted for password)..."
+            
+            cat "${key_file}.pub" | ssh "$dl_user@$dl_host" '
+                mkdir -p ~/.ssh && chmod 700 ~/.ssh
+                cat > ~/.ssh/tmp_key
+                if ! grep -qFf ~/.ssh/tmp_key ~/.ssh/authorized_keys 2>/dev/null; then
+                    cat ~/.ssh/tmp_key >> ~/.ssh/authorized_keys
+                    echo "  Key added to authorized_keys"
+                else
+                    echo "  Key already in authorized_keys"
+                fi
+                chmod 600 ~/.ssh/authorized_keys
+                rm -f ~/.ssh/tmp_key
+            ' || {
+                echo "ERROR: Failed to copy SSH key to $dl_host" >&2
+                return 1
+            }
+        fi
+        
+        echo ""
+        echo "  Setting up remote directories..."
+        ssh "$dl_user@$dl_host" '
+            mkdir -p ~/projects
+            mkdir -p /scratch/scratch/data/$USER 2>/dev/null || true
+            mkdir -p /scratch/scratch/output/$USER 2>/dev/null || true
+            ln -sf /scratch/scratch/data/$USER ~/data 2>/dev/null || true
+            ln -sf /scratch/scratch/output/$USER ~/output 2>/dev/null || true
+            touch ~/.hushlogin
+            echo "  Remote directories configured:"
+            echo "    ~/projects -> project files"
+            echo "    ~/data     -> /scratch/scratch/data/$USER"
+            echo "    ~/output   -> /scratch/scratch/output/$USER"
+        ' || {
+            echo "ERROR: Failed to setup remote directories" >&2
+            return 1
+        }
+        
+        echo ""
+        echo "  ✓ SSH setup complete"
+        echo ""
+    fi
+
+    # ==================== KUBECONFIG SETUP ====================
+    if [[ $skip_kubeconfig -eq 0 ]]; then
+        echo "=== Step 2: Kubeconfig Setup ==="
+        echo ""
+        
+        local kube_dir="$HOME/.kube"
+        local kube_config="$kube_dir/config"
+        local need_kubeconfig=1
+        
+        mkdir -p "$kube_dir"
+        chmod 700 "$kube_dir"
+        
+        if [[ -f "$kube_config" ]]; then
+            echo "  Found existing file: $kube_config"
+            
+            local validation_result
+            _validate_kubeconfig "$kube_config"
+            validation_result=$?
+            
+            if [[ $validation_result -eq 0 ]]; then
+                echo "  ✓ Valid kubeconfig file"
+                need_kubeconfig=0
+            elif [[ $validation_result -eq 2 ]]; then
+                echo ""
+                echo "  ⚠ This file is NOT a kubeconfig!"
+                echo "    It appears to be a Kubernetes resource definition."
+                echo ""
+            else
+                echo "  ⚠ File exists but doesn't look like a valid kubeconfig"
+            fi
+        fi
+        
+        if [[ $need_kubeconfig -eq 1 ]]; then
+            echo ""
+            echo "  Searching for kubeconfig files in ~/Downloads..."
+            
+            local found_configs=()
+            for f in ~/Downloads/*.yaml ~/Downloads/*.yml ~/Downloads/kubeconfig* ~/Downloads/config; do
+                if [[ -f "$f" ]]; then
+                    if _validate_kubeconfig "$f" 2>/dev/null; then
+                        found_configs+=("$f")
+                    fi
+                fi
+            done
+            
+            if [[ ${#found_configs[@]} -gt 0 ]]; then
+                echo ""
+                echo "  Found potential kubeconfig files:"
+                local i=1
+                for f in "${found_configs[@]}"; do
+                    echo "    $i) $f"
+                    ((i++))
+                done
+                echo "    $i) Download new kubeconfig"
+                echo "    $((i+1))) Skip"
+                echo ""
+                
+                read "choice?  Select an option [1-$((i+1))]: "
+                
+                if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#found_configs[@]} ]]; then
+                    local selected="${found_configs[$choice]}"
+                    echo ""
+                    echo "  Copying $selected to $kube_config..."
+                    cp "$selected" "$kube_config"
+                    chmod 600 "$kube_config"
+                    echo "  ✓ Kubeconfig installed"
+                    need_kubeconfig=0
+                elif [[ "$choice" == "$((i+1))" ]]; then
+                    echo "  Skipping kubeconfig setup"
+                    need_kubeconfig=0
+                fi
+            fi
+        fi
+        
+        if [[ $need_kubeconfig -eq 1 ]]; then
+            echo ""
+            echo "  ┌──────────────────────────────────────────────────────────────────┐"
+            echo "  │  HOW TO DOWNLOAD YOUR KUBECONFIG                                 │"
+            echo "  ├──────────────────────────────────────────────────────────────────┤"
+            echo "  │  1. Go to: https://rancher.iis.fhg.de/                           │"
+            echo "  │  2. Log in with your IIS credentials                             │"
+            echo "  │  3. Click on the cluster name (e.g., 'dl')                       │"
+            echo "  │  4. Look for the DOWNLOAD ICON in the TOP-RIGHT corner           │"
+            echo "  │  5. Save the file                                                │"
+            echo "  └──────────────────────────────────────────────────────────────────┘"
+            echo ""
+            
+            read -q "REPLY?  Open Rancher in browser now? [y/N] "
+            echo ""
+            if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+                if command -v xdg-open &>/dev/null; then
+                    xdg-open "https://rancher.iis.fhg.de/" 2>/dev/null &
+                elif command -v open &>/dev/null; then
+                    open "https://rancher.iis.fhg.de/"
+                else
+                    echo "  Please open: https://rancher.iis.fhg.de/"
+                fi
+                echo ""
+                echo "  After downloading the kubeconfig, press Enter..."
+                read
+                
+                for f in ~/Downloads/*.yaml ~/Downloads/*.yml ~/Downloads/kubeconfig* ~/Downloads/config; do
+                    if [[ -f "$f" ]]; then
+                        if _validate_kubeconfig "$f" 2>/dev/null; then
+                            echo "  Found: $f"
+                            read -q "REPLY?  Use this file? [y/N] "
+                            echo ""
+                            if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+                                cp "$f" "$kube_config"
+                                chmod 600 "$kube_config"
+                                echo "  ✓ Kubeconfig installed to $kube_config"
+                                need_kubeconfig=0
+                                break
+                            fi
+                        fi
+                    fi
+                done
+            fi
+        fi
+        
+        if [[ -f "$kube_config" ]]; then
+            if [[ -z "$DL_KUBECONFIG" ]]; then
+                echo ""
+                echo "  ⚠ DL_KUBECONFIG not set in environment"
+            fi
+        fi
+        echo ""
+    fi
+
+    # ==================== NAMESPACE SETUP ====================
+    echo "=== Step 3: Namespace Configuration ==="
+    echo ""
+    
+    if [[ -n "$DL_NAMESPACE" ]]; then
+        echo "  Current DL_NAMESPACE: $DL_NAMESPACE"
+        
+        if [[ -f "${DL_KUBECONFIG:-$HOME/.kube/config}" ]]; then
+            if _kubectl get ns "$DL_NAMESPACE" &>/dev/null; then
+                echo "  ✓ Namespace is accessible"
+            else
+                echo "  ⚠ Cannot access namespace (may not exist or no permission)"
+            fi
+        fi
     else
-        ssh-keygen -t rsa -f "$local_ssh_directory/id_rsa"
-        echo INFO: RSA key pair generated
+        echo "  DL_NAMESPACE is not set"
+        echo ""
+        echo "  Your namespace is typically:"
+        echo "    - Personal: kflow-<shortname> (e.g., kflow-opt)"
+        echo "    - Team:     oe-<number> (e.g., oe-12345)"
+        echo ""
+        
+        if [[ -f "${DL_KUBECONFIG:-$HOME/.kube/config}" ]]; then
+            echo "  Available contexts from kubeconfig:"
+            _kubectl config get-contexts 2>/dev/null | head -10 | sed 's/^/    /'
+            echo ""
+        fi
+        
+        read "ns_input?  Enter your namespace (or press Enter to skip): "
+        
+        if [[ -n "$ns_input" ]]; then
+            export DL_NAMESPACE="$ns_input"
+            echo "  ✓ Namespace set to: $DL_NAMESPACE (this session only)"
+        fi
     fi
+    echo ""
 
-    echo "We need to log into $dl_host as $dl_user to set up your public key."
-    cat "$local_ssh_directory/id_rsa.pub" | ssh "$dl_host" -l "$dl_user" ' [ -d ~/.ssh ] || \
-                                                                mkdir -p ~/.ssh ; \
-                                                                cat > ~/.ssh/KEY ; \
-                                                                KEY=$(cat ~/.ssh/KEY) ; \
-                                                                export KEY ; \
-                                                                grep -q "$KEY" ~/.ssh/authorized_keys || \
-                                                                cat ~/.ssh/KEY >> .ssh/authorized_keys ; \
-                                                                chmod 700 ~/.ssh ; \
-                                                                chmod 600 ~/.ssh/authorized_keys ;
-                                                                rm ~/.ssh/KEY'
-    id_rsa_transfer_status=$?
-
-    if [[ $id_rsa_transfer_status -eq 0 ]]; then
-        echo "INFO: SSH set up complete: [HOST: $dl_host]"
+    # ==================== SUMMARY ====================
+    echo "╔════════════════════════════════════════════════════════════════════╗"
+    echo "║                     SETUP SUMMARY                                  ║"
+    echo "╠════════════════════════════════════════════════════════════════════╣"
+    echo ""
+    echo "  Add these lines to your ~/.zshrc:"
+    echo ""
+    echo "  # DL Cluster Configuration"
+    if [[ -f "$HOME/.kube/config" ]]; then
+        echo "  export DL_KUBECONFIG=\"\$HOME/.kube/config\""
     else
-        echo "ERROR: SSH setup failed."
-        return 1
+        echo "  export DL_KUBECONFIG=\"\$HOME/.kube/config\"  # Install kubeconfig first!"
     fi
-
-    # Create project directory
-    ssh $dl_user@$dl_host 'mkdir projects'
-    ssh $dl_user@$dl_host 'touch .hushlogin'
-    ssh $dl_user@$dl_host "ln -s /scratch/scatch/data/$dl_user/ data"
-    ssh $dl_user@$dl_host "ln -s /scratch/scratch/output/$dl_user/ output"
-    return 0
+    if [[ -n "$DL_NAMESPACE" ]]; then
+        echo "  export DL_NAMESPACE=\"$DL_NAMESPACE\""
+    else
+        echo "  export DL_NAMESPACE=\"oe-XXXXX\"  # Replace with your namespace"
+    fi
+    echo ""
+    echo "  Then run: source ~/.zshrc"
+    echo ""
+    echo "╚════════════════════════════════════════════════════════════════════╝"
+    
+    echo ""
+    dlstatus
 }
 
