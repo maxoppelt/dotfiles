@@ -34,16 +34,20 @@
 #     2026/03/09 : Maximilian Oppelt : Updated NFS server to hostname, new default PyTorch image,
 #                                      improved dlinit with kubeconfig/namespace checks,
 #                                      better SSH key handling (supports ed25519/rsa).
+#     2026/03/25 : Maximilian Oppelt : Added --env flag to dlr(). Environment variable injection via
+#                                      --env KEY=VALUE.
 #
 #================================================================
 
 # ======================== CONSTANTS ============================
 
-readonly DL_HOST_DEFAULT="dlcluster1scratch.iis.fhg.de"
-readonly DL_IMAGE_DEFAULT="ghcr.io/maxoppelt/pytorch-cm_60:2.7.1"
-readonly DL_ACCELERATOR_DEFAULT="Tesla-P100-SXM2-16GB"
-readonly NFS_SERVER="10.54.182.12"
-readonly DL_TTL_DEFAULT=3600  # 1 hour after completion
+: "${DL_HOST_DEFAULT:=dlcluster1scratch.iis.fhg.de}"
+: "${DL_IMAGE_DEFAULT:=ghcr.io/maxoppelt/pytorch-sm_60:2.7.1}"
+: "${DL_ACCELERATOR_DEFAULT:=Tesla-P100-SXM2-16GB}"
+: "${NFS_SERVER:=10.54.182.12}"
+: "${DL_TTL_DEFAULT:=3600}"  # 1 hour after completion
+declare -a __DL_EXTRA_NFS_MOUNTS=()
+declare -a __DL_EXTRA_ENVS=()
 
 # User-configurable (can be set in .zshrc)
 
@@ -145,6 +149,8 @@ function dlh() {
 ║    --no-cleanup             Don't delete project files after job   ║
 ║    --no-git                 Don't require git repository           ║
 ║    --secret NAME            imagePullSecret for private registry   ║
+║    --mount-nfs SERVER:NAME  Mount NFS share at /mnt/NAME (multiple: comma-separated)
+║    --env KEY=VALUE          Set environment variable (repeatable)
 ╚════════════════════════════════════════════════════════════════════╝
 EOF
 }
@@ -388,6 +394,25 @@ function _generate_container_spec() {
     local cleanup_cmd=""
     [[ "$cleanup_project" == "true" ]] && cleanup_cmd="rm -Rf $container_scope_project ;"
 
+    local extra_mounts=""
+    if [[ ${#__DL_EXTRA_NFS_MOUNTS[@]} -gt 0 ]]; then
+        for mount in "${__DL_EXTRA_NFS_MOUNTS[@]}"; do
+            local mountname="${mount##*:}"
+            # Sanitize volume name: keep only alphanumeric and hyphen
+            local vol_name="nfs-extra-${mountname}"
+            vol_name=$(echo "$vol_name" | sed 's/[^-a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
+            extra_mounts+=$'\n                '"- name: ${vol_name}"$'\n'$'\n                  '"mountPath: /mnt/${mountname}"
+        done
+    fi
+
+    local extra_chowns=""
+    if [[ ${#__DL_EXTRA_NFS_MOUNTS[@]} -gt 0 ]]; then
+        for mount in "${__DL_EXTRA_NFS_MOUNTS[@]}"; do
+            local mountname="${mount##*:}"
+            extra_chowns+="                  chown -R ${dl_uid}:${dl_gid} /mnt/${mountname} 2>/dev/null || true ;"$'\n'
+        done
+    fi
+
     cat <<EOF
             - name: pytorch
 
@@ -420,6 +445,13 @@ function _generate_container_spec() {
                 - name: NVIDIA_DISABLE_REQUIRE
 
                   value: "true"
+$(for env_pair in "${__DL_EXTRA_ENVS[@]}"; do
+    local env_name="${env_pair%%=*}"
+    local env_value="${env_pair#*=}"
+    echo "                - name: $env_name"
+    echo ""
+    echo "                  value: \"$env_value\""
+done)
               command: ["/bin/bash", "-c"]
               args:
                 - set -e ;
@@ -429,7 +461,7 @@ function _generate_container_spec() {
                   /bin/bash ./$dl_script ;
                   chown -R $dl_uid:$dl_gid $container_scope_data 2>/dev/null || true ;
                   chown -R $dl_uid:$dl_gid $container_scope_output 2>/dev/null || true ;
-                  $cleanup_cmd
+${extra_chowns}                  $cleanup_cmd
               resources:
                 requests:
                   cpu: $dl_cpus
@@ -452,7 +484,7 @@ function _generate_container_spec() {
                   mountPath: $container_scope_home
                 - name: dshm
 
-                  mountPath: /dev/shm
+                  mountPath: /dev/shm${extra_mounts}
 EOF
 }
 
@@ -464,6 +496,21 @@ function _generate_volumes_spec() {
     local dl_scope_home="$1"
     local dl_scope_data="$2"
     local dl_scope_output="$3"
+
+    local extra_volumes=""
+    if [[ ${#__DL_EXTRA_NFS_MOUNTS[@]} -gt 0 ]]; then
+        for mount in "${__DL_EXTRA_NFS_MOUNTS[@]}"; do
+            local server="${mount%%:*}"
+            local mountname="${mount##*:}"
+            # Sanitize volume name: keep only alphanumeric and hyphen
+            local vol_name="nfs-extra-${mountname}"
+            vol_name=$(echo "$vol_name" | sed 's/[^-a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
+            # Ensure mountname is absolute path for NFS path
+            local nfs_path="$mountname"
+            [[ "$nfs_path" != /* ]] && nfs_path="/$nfs_path"
+            extra_volumes+=$'\n            '"- name: ${vol_name}"$'\n'$'\n              '"nfs:"$'\n                '"server: $server"$'\n                '"path: $nfs_path"$'\n                '"readOnly: false"
+        done
+    fi
 
     cat <<EOF
           volumes:
@@ -489,7 +536,7 @@ function _generate_volumes_spec() {
 
               emptyDir:
                 medium: Memory
-                sizeLimit: 8Gi
+                sizeLimit: 8Gi${extra_volumes}
 EOF
 }
 
@@ -512,6 +559,8 @@ function dlr() {
     local image_pull_secret=""
     local dry_run=0
     local require_git=1  # NEW: default to requiring git, can disable
+    local dl_nfs_mounts=()
+    local dl_envs=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -543,12 +592,41 @@ function dlr() {
             --no-git)               require_git=0 ;;  # NEW: disable git requirement
             --secret=*)             image_pull_secret="${1#*=}" ;;
             --secret)               shift; image_pull_secret="$1" ;;
+            --mount-nfs=*)
+                local mounts=(${(s:,:)${1#*=}})
+                for mount in "${mounts[@]}"; do
+                    if [[ "$mount" =~ ^[^:]+:[^:]+$ ]]; then
+                        dl_nfs_mounts+=("$mount")
+                    else
+                        echo "ERROR: Invalid NFS mount format '$mount'. Expected server:mountname" >&2
+                        return 1
+                    fi
+                done
+                ;;
+            --mount-nfs)
+                shift
+                local mounts=(${(s:,:)1})
+                for mount in "${mounts[@]}"; do
+                    if [[ "$mount" =~ ^[^:]+:[^:]+$ ]]; then
+                        dl_nfs_mounts+=("$mount")
+                    else
+                        echo "ERROR: Invalid NFS mount format '$mount'. Expected server:mountname" >&2
+                        return 1
+                    fi
+                done
+                ;;
+            --env=*)                dl_envs+=("${1#*=}") ;;
+            --env)                  shift; dl_envs+=("$1") ;;
             --dry-run)              dry_run=1 ;;
             -*)                     echo "ERROR: Unknown option $1" >&2; return 1 ;;
             *)                      dl_script="$1" ;;
         esac
         shift
     done
+
+    # Set global extra NFS mounts for helper functions
+    __DL_EXTRA_NFS_MOUNTS=("${dl_nfs_mounts[@]}")
+    __DL_EXTRA_ENVS=("${dl_envs[@]}")
 
     # Validate GPU count
     if [[ "$dl_gpus" -gt 4 ]]; then
