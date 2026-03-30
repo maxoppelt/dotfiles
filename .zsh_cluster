@@ -1,7 +1,7 @@
 #!/bin/bash
 #================================================================
 #- IMPLEMENTATION
-#-    version         0.1.1
+#-    version         0.1.2
 #-    author          Maximilian Oppelt
 #-
 #================================================================
@@ -36,6 +36,7 @@
 #                                      better SSH key handling (supports ed25519/rsa).
 #     2026/03/25 : Maximilian Oppelt : Added --env flag to dlr(). Environment variable injection via
 #                                      --env KEY=VALUE.
+#     2026/03/30 : Maximilian Oppelt : Both DL_USER and DL_GROUP are now passed as environment variables.
 #
 #================================================================
 
@@ -442,6 +443,15 @@ function _generate_container_spec() {
                 - name: PROJECT_PATH
 
                   value: "$container_scope_project"
+                - name: DL_USER
+
+                  value: "$dl_user"
+                - name: DL_UID
+
+                  value: "$dl_uid"
+                - name: DL_GID
+
+                  value: "$dl_gid"
                 - name: NVIDIA_DISABLE_REQUIRE
 
                   value: "true"
