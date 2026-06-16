@@ -406,13 +406,6 @@ function _generate_container_spec() {
         done
     fi
 
-    local extra_chowns=""
-    if [[ ${#__DL_EXTRA_NFS_MOUNTS[@]} -gt 0 ]]; then
-        for mount in "${__DL_EXTRA_NFS_MOUNTS[@]}"; do
-            local mountname="${mount##*:}"
-            extra_chowns+="                  chown -R ${dl_uid}:${dl_gid} /mnt/${mountname} 2>/dev/null || true ;"$'\n'
-        done
-    fi
 
     cat <<EOF
             - name: pytorch
@@ -471,7 +464,7 @@ done)
                   /bin/bash ./$dl_script ;
                   chown -R $dl_uid:$dl_gid $container_scope_data 2>/dev/null || true ;
                   chown -R $dl_uid:$dl_gid $container_scope_output 2>/dev/null || true ;
-${extra_chowns}                  $cleanup_cmd
+                  $cleanup_cmd
               resources:
                 requests:
                   cpu: $dl_cpus
@@ -493,7 +486,6 @@ ${extra_chowns}                  $cleanup_cmd
 
                   mountPath: $container_scope_home
                 - name: dshm
-
                   mountPath: /dev/shm${extra_mounts}
 EOF
 }
@@ -543,10 +535,9 @@ function _generate_volumes_spec() {
                 path: $dl_scope_home
                 readOnly: false
             - name: dshm
-
               emptyDir:
                 medium: Memory
-                sizeLimit: 8Gi${extra_volumes}
+                sizeLimit: 12Gi${extra_volumes}
 EOF
 }
 
